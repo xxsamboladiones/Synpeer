@@ -1,3 +1,7 @@
-import { BootstrapScreen } from '@/features/bootstrap/BootstrapScreen';
+import { router } from 'expo-router';
 
-export default BootstrapScreen;
+import { SplashScreen } from '@/features/navigation/screens';
+
+export default function SplashRoute() {
+  return <SplashScreen onReady={() => router.replace('/onboarding')} />;
+}

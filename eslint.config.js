@@ -34,6 +34,8 @@ module.exports = [
       globals: {
         __DEV__: 'readonly',
         console: 'readonly',
+        clearTimeout: 'readonly',
+        setTimeout: 'readonly',
         jest: 'readonly',
         describe: 'readonly',
         expect: 'readonly',
