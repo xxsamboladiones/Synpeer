@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Animated, Easing } from 'react-native';
 
 import { animation } from '@/styles/tokens';
+import { supportsNativeAnimatedDriver } from '@/utils/animationDriver';
 
 export function useFadeIn() {
   const [opacity] = useState(() => new Animated.Value(0));
@@ -13,13 +14,13 @@ export function useFadeIn() {
         toValue: 1,
         duration: animation.duration.normal,
         easing: Easing.out(Easing.cubic),
-        useNativeDriver: true,
+        useNativeDriver: supportsNativeAnimatedDriver,
       }),
       Animated.timing(translateY, {
         toValue: 0,
         duration: animation.duration.normal,
         easing: Easing.out(Easing.cubic),
-        useNativeDriver: true,
+        useNativeDriver: supportsNativeAnimatedDriver,
       }),
     ]).start();
   }, [opacity, translateY]);

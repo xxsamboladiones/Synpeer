@@ -1,7 +1,7 @@
 import { router } from 'expo-router';
 
-import { CreateIdentityPlaceholderScreen } from '@/features/navigation/screens';
+import { CreateIdentityScreen } from '@/features/identity/CreateIdentityScreen';
 
 export default function CreateIdentityRoute() {
-  return <CreateIdentityPlaceholderScreen onContinue={() => router.replace('/home')} />;
+  return <CreateIdentityScreen onContinue={() => router.replace('/feed')} />;
 }

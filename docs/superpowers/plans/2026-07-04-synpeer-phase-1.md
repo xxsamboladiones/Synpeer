@@ -1,0 +1,161 @@
+# Synpeer Phase 1 Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Build the technical foundation for Synpeer without social, P2P, blockchain, backend, or wallet functionality.
+
+**Architecture:** The project uses feature-first Clean Architecture. UI, storage, database, cryptography, state, and navigation are isolated behind typed modules and small service boundaries.
+
+**Tech Stack:** React Native, Expo, TypeScript, Expo Router, NativeWind, React Query, Zustand, SQLite, MMKV, React Hook Form, Zod, ESLint, Prettier, Jest.
+
+---
+
+## File Structure
+
+- `app/`: Expo Router entry files that delegate to `src/app`.
+- `src/app/`: route screens and navigation layout implementation.
+- `src/components/`: reusable design-system components.
+- `src/constants/`: design tokens and app constants.
+- `src/services/`: infrastructure services such as local storage.
+- `src/store/`: Zustand stores.
+- `src/database/`: SQLite connection, migrations, and repository base.
+- `src/crypto/`: cryptographic identity service.
+- `src/features/`: feature-first modules, starting with identity.
+- `src/types/`: shared TypeScript types.
+- `src/utils/`: small framework-independent helpers.
+- `src/hooks/`: shared React hooks.
+- `src/network/`: reserved boundary for future P2P, kept empty except for an index file if needed.
+
+## Task 1: Bootstrap Project
+
+**Files:**
+
+- Create: Expo project files in repository root.
+- Create: `src/` directory structure.
+- Create: tooling config for TypeScript, ESLint, Prettier, NativeWind, Babel, Metro, Jest, and environment typing.
+- Modify: `package.json` scripts.
+
+- [x] Scaffold an Expo TypeScript project in the repository root.
+- [x] Install required Phase 1 dependencies.
+- [x] Configure aliases with `@/*` mapped to `src/*`.
+- [x] Configure ESLint and Prettier.
+- [x] Configure NativeWind and Tailwind.
+- [x] Add environment typing without real secrets.
+- [x] Keep local validation scripts ready for optional pre-commit automation.
+- [x] Add source folders with placeholder `.gitkeep` files where a folder has no implementation yet.
+- [x] Run `npm run lint`, `npm run typecheck`, and `npm test`.
+- [x] Commit with `chore: bootstrap expo foundation`.
+
+## Task 2: Design System
+
+**Files:**
+
+- Create: `src/constants/theme.ts`
+- Create: `src/components/ui/Button.tsx`
+- Create: `src/components/ui/Input.tsx`
+- Create: `src/components/ui/Avatar.tsx`
+- Create: `src/components/ui/Card.tsx`
+- Create: `src/components/ui/Modal.tsx`
+- Create: `src/components/ui/Loading.tsx`
+- Create: `src/components/ui/Header.tsx`
+- Create: `src/components/ui/Screen.tsx`
+- Create: `src/components/ui/Text.tsx`
+- Test: component smoke tests where practical.
+
+- [x] Write tests for token exports and component render basics.
+- [x] Implement dark-first tokens and reusable UI components.
+- [x] Run lint, typecheck, tests.
+- [x] Commit with `feat: add dark design system`.
+
+## Task 3: Navigation Base
+
+**Files:**
+
+- Create/modify: `app/_layout.tsx`
+- Create: route files for Splash, Onboarding, Create Identity, Home, Profile, and Settings.
+- Create: `src/app/navigation/`
+
+- [x] Write route/component smoke tests.
+- [x] Implement navigation structure with polished structural screens only.
+- [x] Run lint, typecheck, tests.
+- [x] Commit with `feat: add base navigation`.
+
+## Task 4: MMKV Storage
+
+**Files:**
+
+- Create: `src/services/storage/StorageService.ts`
+- Create: `src/services/storage/mmkvStorage.ts`
+- Test: storage service unit tests.
+
+- [x] Write failing tests for set/get/remove/clear behavior.
+- [x] Implement MMKV-backed storage abstraction.
+- [x] Keep StorageService independent so Zustand depends on storage, never the reverse.
+- [x] Run lint, typecheck, tests.
+- [x] Commit with `feat: add local storage service`.
+
+## Task 5: Zustand Stores
+
+**Files:**
+
+- Create: `src/store/authStore.ts`
+- Create: `src/store/profileStore.ts`
+- Create: `src/store/walletStore.ts`
+- Create: `src/store/settingsStore.ts`
+- Create: `src/store/networkStore.ts`
+- Create: `src/store/contributionStore.ts`
+
+- [x] Write tests for initial store state.
+- [x] Implement typed empty stores with persistence only through StorageService where immediately useful.
+- [x] Run lint, typecheck, tests.
+- [x] Commit with `feat: add global state stores`.
+
+## Task 6: SQLite Infrastructure
+
+**Files:**
+
+- Create: `src/database/DatabaseService.ts`
+- Create: `src/database/migrations/MigrationRunner.ts`
+- Create: `src/database/repositories/Repository.ts`
+
+- [x] Write tests for migration ordering and repository boundary types.
+- [x] Implement empty schema engine, migration runner, query wrapper, and abstract repository base.
+- [x] Run lint, typecheck, tests.
+- [x] Commit with `feat: add sqlite infrastructure`.
+
+## Task 7: CryptoService
+
+**Files:**
+
+- Create: `src/crypto/CryptoService.ts`
+- Create: `src/crypto/CryptoTypes.ts`
+- Test: cryptographic identity generation/load tests.
+
+- [x] Write failing tests for generating and loading an identity key pair.
+- [x] Implement Ed25519 key generation and local persistence boundary with a deterministic portable public identity format.
+- [x] Ensure private key material is never exposed outside `src/crypto`.
+- [x] Run lint, typecheck, tests.
+- [x] Commit with `feat: add cryptographic identity service`.
+
+## Task 8: Create Identity Flow
+
+**Files:**
+
+- Create/modify: `src/features/identity/`
+- Modify: Create Identity route.
+
+- [x] Write tests for form validation and local save behavior.
+- [x] Implement automatic key generation, visible public ID, local name/photo placeholder, continue action, and `identityCreated` persistence through the approved state/storage boundary.
+- [x] Run lint, typecheck, tests.
+- [x] Commit with `feat: add create identity flow`.
+
+## Task 9: Hardening
+
+**Files:**
+
+- Modify only files that need cleanup.
+
+- [x] Run full lint, typecheck, tests, and Expo config validation.
+- [x] Remove dead code and fix warnings.
+- [x] Review scope against the Phase 1 spec.
+- [x] Commit with `chore: harden phase 1 foundation`.

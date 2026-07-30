@@ -1,11 +1,11 @@
 {
   "expo": {
-    "name": "Insta99",
-    "slug": "insta99",
+    "name": "Synpeer",
+    "slug": "synpeer",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./src/assets/icon.png",
-    "scheme": "insta99",
+    "scheme": ["synpeer", "insta99"],
     "userInterfaceStyle": "dark",
     "ios": {
       "supportsTablet": true

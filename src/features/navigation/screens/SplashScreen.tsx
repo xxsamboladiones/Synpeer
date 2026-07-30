@@ -17,11 +17,11 @@ export function SplashScreen({ onReady }: SplashScreenProps) {
   return (
     <Screen>
       <View style={styles.content}>
-        <Text variant="display">Insta99</Text>
+        <Text variant="display">Synpeer</Text>
         <Text variant="body" tone="secondary" style={styles.tagline}>
-          Rede social local-first. Visual foundation only.
+          Rede social P2P local-first.
         </Text>
-        <Loading label="Inicializando interface" />
+        <Loading label="Inicializando rede" />
       </View>
     </Screen>
   );

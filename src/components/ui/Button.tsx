@@ -9,6 +9,7 @@ import {
 } from 'react-native';
 
 import { useTheme } from '@/styles/theme';
+import { supportsNativeAnimatedDriver } from '@/utils/animationDriver';
 
 import { Text } from './Text';
 
@@ -54,7 +55,7 @@ export function Button({
     Animated.timing(scale, {
       toValue,
       duration: theme.animation.duration.fast,
-      useNativeDriver: true,
+      useNativeDriver: supportsNativeAnimatedDriver,
     }).start();
   }
 

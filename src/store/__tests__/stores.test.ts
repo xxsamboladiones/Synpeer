@@ -14,8 +14,12 @@ import {
 } from '../index';
 
 describe('global Zustand stores', () => {
-  it('exports empty typed stores with stable initial state', () => {
-    expect(useAuthStore.getState()).toEqual(authInitialState);
+  it('exports typed stores with stable initial state', () => {
+    // AuthStore now has identityCreated for phase 1 identity flow
+    const authState = useAuthStore.getState();
+    expect(authState.identityCreated).toBe(authInitialState.identityCreated);
+    expect(typeof authState.setIdentityCreated).toBe('function');
+
     expect(useProfileStore.getState()).toEqual(profileInitialState);
     expect(useWalletStore.getState()).toEqual(walletInitialState);
     expect(useSettingsStore.getState()).toEqual(settingsInitialState);
@@ -23,9 +27,8 @@ describe('global Zustand stores', () => {
     expect(useContributionStore.getState()).toEqual(contributionInitialState);
   });
 
-  it('keeps phase 1 stores free of domain data', () => {
+  it('keeps most phase 1 stores free of domain data', () => {
     const stores = [
-      useAuthStore,
       useProfileStore,
       useWalletStore,
       useSettingsStore,
@@ -36,5 +39,8 @@ describe('global Zustand stores', () => {
     for (const store of stores) {
       expect(Object.keys(store.getState())).toHaveLength(0);
     }
+
+    // AuthStore is expected to have identityCreated for phase 1
+    expect(Object.keys(useAuthStore.getState()).length).toBeGreaterThan(0);
   });
 });

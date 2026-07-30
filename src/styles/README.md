@@ -1,4 +1,4 @@
-# Insta99 Design System
+# Synpeer Design System
 
 The design system is dark-first, mobile-first, and inspired by restrained 80s neon interfaces. It provides visual primitives only: no social, identity, network, storage, or domain behavior belongs here.
 

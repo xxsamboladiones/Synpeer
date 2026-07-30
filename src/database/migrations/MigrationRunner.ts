@@ -1,6 +1,6 @@
 export type DatabaseExecutor = {
   execute: (statement: string) => Promise<void>;
-  transaction: (work: (database: DatabaseExecutor) => Promise<void>) => Promise<void>;
+  transaction: <T>(work: (database: DatabaseExecutor) => Promise<T>) => Promise<T>;
 };
 
 export type Migration = {

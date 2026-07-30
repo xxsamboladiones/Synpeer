@@ -1,6 +1,10 @@
 node_modules
 .expo
 dist
+dist-web-test
 web-build
+test-results
 coverage
 package-lock.json
+.devin
+.playwright-cli

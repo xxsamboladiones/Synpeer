@@ -12,8 +12,9 @@ function createExecutor() {
     },
     transaction: async (work) => {
       calls.push('BEGIN');
-      await work(executor);
+      const result = await work(executor);
       calls.push('COMMIT');
+      return result;
     },
   };
 

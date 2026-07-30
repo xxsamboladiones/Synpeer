@@ -6,7 +6,9 @@ node_modules/
 # Expo
 .expo/
 dist/
+dist-web-test/
 web-build/
+test-results/
 expo-env.d.ts
 
 # Native
@@ -34,7 +36,10 @@ yarn-error.*
 .env
 .env.*
 .env*.local
+!.env.example
 .worktrees/
+.devin/
+.playwright-cli/
 
 # typescript
 *.tsbuildinfo

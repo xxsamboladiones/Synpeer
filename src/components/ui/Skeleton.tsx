@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Animated, StyleSheet, type ViewStyle } from 'react-native';
 
 import { useTheme } from '@/styles/theme';
+import { supportsNativeAnimatedDriver } from '@/utils/animationDriver';
 
 export type SkeletonProps = {
   width?: ViewStyle['width'];
@@ -24,12 +25,12 @@ export function Skeleton({ width = '100%', height = 18, radius, animated = true 
         Animated.timing(opacity, {
           toValue: 0.72,
           duration: theme.animation.duration.slow,
-          useNativeDriver: true,
+          useNativeDriver: supportsNativeAnimatedDriver,
         }),
         Animated.timing(opacity, {
           toValue: 0.36,
           duration: theme.animation.duration.slow,
-          useNativeDriver: true,
+          useNativeDriver: supportsNativeAnimatedDriver,
         }),
       ]),
     );
