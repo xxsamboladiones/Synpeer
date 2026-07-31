@@ -193,17 +193,17 @@ recibos e midia permanecem armazenados e replicados pelos peers.
 
 ## Bloco 15.5 - Reparacao e disponibilidade de midia
 
-- [ ] Versionar e assinar anuncios de disponibilidade de objetos e chunks.
-- [ ] Expirar anuncios antigos e remover peers comprovadamente indisponiveis.
-- [ ] Selecionar candidatos por integridade, disponibilidade e historico de falha.
-- [ ] Manter frames abaixo do limite do data channel com backpressure.
-- [ ] Retomar o download no primeiro chunk ausente depois de reload.
-- [ ] Rejeitar chunk cujo hash nao corresponde ao manifesto.
-- [ ] Trocar de replica sem reiniciar chunks ja validados.
-- [ ] Validar o hash do objeto completo depois da remontagem.
-- [ ] Colocar replica repetidamente corrompida em quarentena local.
-- [ ] Reparar o numero minimo configurado de replicas em segundo plano.
-- [ ] Respeitar quota de cache, retencao e garbage collection.
+- [x] Versionar e assinar anuncios de disponibilidade de objetos e chunks.
+- [x] Expirar anuncios antigos e remover peers comprovadamente indisponiveis.
+- [x] Selecionar candidatos por integridade, disponibilidade e historico de falha.
+- [x] Manter frames abaixo do limite do data channel com backpressure.
+- [x] Retomar o download no primeiro chunk ausente depois de reload.
+- [x] Rejeitar chunk cujo hash nao corresponde ao manifesto.
+- [x] Trocar de replica sem reiniciar chunks ja validados.
+- [x] Validar o hash do objeto completo depois da remontagem.
+- [x] Colocar replica repetidamente corrompida em quarentena local.
+- [x] Reparar o numero minimo configurado de replicas em segundo plano.
+- [x] Respeitar quota de cache, retencao e garbage collection.
 
 ### Diagnostico de entrada
 
@@ -411,6 +411,46 @@ Validacao:
    comprovada; a quarentena e local, expiravel e nao altera trust global.
 7. Tentar imediatamente a proxima fonte integra sem reiniciar o objeto.
 
+Status: concluido em 2026-07-31.
+
+Implementacao:
+
+- `MediaAvailabilityAnnouncementV2` possui emissor, sequencia monotona, emissao,
+  expiracao, pagina, itens e assinatura Ed25519 da identidade local.
+- `MediaAvailabilityService` usa serializacao canonica, limita TTL, clock skew,
+  itens, chunks e bytes por pagina, e rejeita remetente divergente, assinatura
+  invalida, replay, conflito, expiracao e sequencia antiga.
+- Anuncios grandes sao paginados antes do envio. Todas as paginas compartilham
+  a mesma sequencia assinada e permanecem abaixo do limite reservado para o
+  envelope de rede.
+- O bootstrap revalida criptograficamente anuncios recuperados do storage. Um
+  registro adulterado e removido antes de poder influenciar o roteamento.
+- A persistencia preserva um cabecalho expirado da ultima sequencia por peer
+  somente para monotonicidade; itens expirados nunca entram na selecao.
+- Manifestos v1 continuam legiveis para migracao e diagnostico, mas nao servem
+  mais como prova de disponibilidade nem retomam downloads.
+- `media_replica_observations` e `media_quarantine_records` passaram a ter APIs
+  tipadas no repository e persistem sucesso, falha, latencia, evidencia,
+  expiracao e contagem de corrupcoes no IndexedDB/SQLite.
+- `MediaSourceSelector` ordena fontes de forma deterministica usando anuncio
+  fresco, historico persistido, latencia e ID do peer como desempate.
+- Uma resposta de chunk com base64, metadados, hash, ID, posicao, tamanho ou
+  objeto invalidos coloca apenas a combinacao peer/objeto/chunk em quarentena.
+- Depois da corrupcao, o download tenta a proxima fonte integra e preserva todos
+  os chunks previamente validados.
+
+Validacao:
+
+- `npm.cmd run verify`: aprovado; secret scan, lint, typecheck, 64 suites e 328
+  testes, e export web concluidos.
+- `npm.cmd run test:e2e:mesh:repeat`: 9 cenarios aprovados em 5,9 minutos, com
+  tres repeticoes isoladas da malha A-B-C-D.
+- Os testes novos cobrem assinatura, adulteracao, expiracao, replay, sequencia,
+  paginacao, reabertura do IndexedDB, selecao deterministica, quarentena e
+  failover de uma replica corrompida para uma integra.
+- Corrupcao remota e reparo automatico ainda precisam entrar na matriz
+  Playwright especifica dos blocos 15.5.6 e 15.5.7.
+
 #### 15.5.5 - Transporte e backpressure
 
 1. Substituir o tamanho fixo de partes por um calculo que inclua base64 e o
@@ -422,6 +462,47 @@ Validacao:
    `stop()`.
 5. Diferenciar timeout, indisponibilidade, corrupcao, cancelamento e storage
    cheio com erros tipados.
+
+Status: concluido em 2026-07-31.
+
+Implementacao:
+
+- `MediaTransferScheduler` mantem uma fila independente por peer, ordenada por
+  prioridade e sequencia, sem permitir crescimento ilimitado de frames, bytes,
+  objetos ou chunks pendentes.
+- O scheduler consulta uma capacidade opcional de flow control do
+  `PeerConnection`. No WebRTC, ele observa `bufferedAmount`, configura
+  `bufferedAmountLowThreshold` e aguarda `bufferedamountlow` antes do proximo
+  envio; um peer bloqueado nao paralisa as filas dos demais.
+- Listeners e timers da espera sao liberados em sucesso, timeout, cancelamento,
+  desconexao e `stop()`. O cancelamento de um objeto tambem encerra requests e
+  partes pendentes daquele download.
+- O tamanho bruto de cada parte e calculado por busca binaria sobre o frame
+  completo: envelope versionado, metadados JSON, correlation ID, base64 e bytes
+  UTF-8. O corte fixo de 64 KiB foi removido.
+- `NetworkMessage` e `WebRtcPeerTransport` passaram a medir tamanho em bytes
+  UTF-8, evitando que texto multibyte ultrapasse silenciosamente o limite.
+- Timeout, peer indisponivel, corrupcao, cancelamento, storage cheio,
+  backpressure e frame excessivo possuem classificacao tipada por
+  `MediaTransferError` e mensagens seguras distintas.
+- O caminho de envio de anuncios, requests, respostas e partes usa o scheduler.
+  Transferencia parcial nao e mais registrada como resposta dividida completa.
+- O health do runtime usa a quantidade real de frames de midia pendentes em
+  `transports.pendingMessages`; o snapshot do scheduler tambem expoe bytes em
+  voo, peers bloqueados, esperas, envios, rejeicoes e cancelamentos.
+
+Validacao:
+
+- Teste integrado com frame configurado em 24 KiB comprovou que um chunk grande
+  foi dividido e que todas as partes permaneceram abaixo desse teto.
+- Testes unitarios cobrem UTF-8, base64, fila limitada, prioridade, isolamento
+  entre peers, `bufferedamountlow`, cancelamento, cleanup e erro de frame.
+- `npm.cmd run verify`: aprovado; secret scan, lint, typecheck, 65 suites e 335
+  testes, e export web concluidos.
+- `npm.cmd run test:e2e:mesh:repeat`: 9 cenarios aprovados em 5,8 minutos, com
+  tres repeticoes isoladas da malha A-B-C-D.
+- Suspensao real de aba, variacao de throughput e TURN continuam dependentes do
+  teste externo entre computadores previsto no Bloco 15.8.
 
 #### 15.5.6 - Reparacao, retencao e runtime
 
@@ -436,6 +517,55 @@ Validacao:
 6. Expor health real: jobs ativos, bytes pendentes, replicas, quarentenas,
    frames bloqueados e ultimo reparo.
 7. Atualizar feed e inspector somente por subscriptions do runtime.
+
+Status: concluido em 2026-07-31.
+
+Implementacao:
+
+- `MediaRepairService` identifica objetos locais completos abaixo de
+  `minReplicas`, oferece replicas somente a peers conectados e verificados e
+  executa novas tentativas em fila com backoff, sem polling periodico.
+- Uma oferta enviada permanece pendente. O reparo so e confirmado depois que o
+  receptor publica um anuncio v2 assinado, fresco, paginado por completo e com
+  exatamente todos os chunks do manifesto.
+- `media.replica.offer` usa o transporte P2P existente e respeita confianca,
+  quota local e backpressure. Ofertas expiradas, futuras, sem objeto conhecido
+  ou acima da quota sao rejeitadas sem anunciar disponibilidade incompleta.
+- `MediaDownloadRepository` persiste ultimo acesso e protecao explicita em
+  `media_access_records`, reconstrui esses dados ao reabrir o IndexedDB e calcula
+  replicas completas sem aceitar manifestos v1, paginas ausentes ou expiradas.
+- A limpeza protege uploads locais, downloads ativos, midia aberta recentemente,
+  itens protegidos pelo usuario e a ultima replica local conhecida. Objetos
+  descartaveis sao ordenados por referencia, disponibilidade externa, ultimo
+  acesso e tamanho.
+- Chunks vinculados corrompidos e chunks orfaos sao removidos por validacao de
+  integridade. O registro de acesso correspondente tambem e eliminado quando o
+  objeto deixa o cache.
+- O runtime inicia o reparador somente depois de validar integridade local e
+  anuncios persistidos, encaminha eventos aceitos de disponibilidade e libera
+  subscriptions, filas e timers em `stop()` e reset.
+- `RuntimeHealthSnapshot.media` expoe jobs e downloads ativos, replicas frescas,
+  quarentenas, frames e bytes pendentes, peers bloqueados, reparos pendentes,
+  objetos sub-replicados e ultimo reparo usando dados reais.
+- Feed e inspector registram acesso real; o inspector deixou de consultar o
+  runtime a cada cinco segundos e agora atualiza por subscription coalescida.
+
+Validacao:
+
+- Testes de repository cobrem persistencia e limpeza de acesso, reabertura do
+  IndexedDB e confirmacao de replica paginada apenas com todas as paginas.
+- Testes de retencao cobrem upload local, download ativo, acesso recente, ultima
+  replica conhecida, preferencia por objeto replicado e chunk corrompido.
+- Testes de reparo cobrem oferta abaixo do minimo, confirmacao por anuncio v2
+  completo, ausencia de oferta no minimo, backoff e cleanup do lifecycle.
+- Testes P2P cobrem download disparado por oferta e recusa recuperavel quando a
+  quota local esta cheia.
+- `npm.cmd run verify`: aprovado; secret scan, lint, typecheck, 66 suites e 345
+  testes, e export web concluidos.
+- `npm.cmd run test:e2e:mesh:repeat`: 9 cenarios aprovados em 6,0 minutos, com
+  tres repeticoes isoladas da malha A-B-C-D.
+- Corrupcao remota, reparo automatico e metricas de bytes ainda precisam entrar
+  na matriz Playwright especifica do Bloco 15.5.7.
 
 #### 15.5.7 - Validacao e remocao do legado
 

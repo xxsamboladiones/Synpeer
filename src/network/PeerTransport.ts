@@ -13,11 +13,20 @@ export type PeerTransportHandler = (
   connection: PeerConnection,
 ) => Promise<void> | void;
 
+export interface PeerConnectionFlowControl {
+  getBufferedAmount(): number;
+  getHighWaterMark(): number;
+  setLowWaterMark(bytes: number): void;
+  isOpen(): boolean;
+  subscribe(handler: () => void): () => void;
+}
+
 export interface PeerConnection {
   peerId: PeerId;
   localPeerId: PeerId;
   connectedAt: number;
   lastSeenAt: number;
+  readonly flowControl?: PeerConnectionFlowControl;
   send<TPayload>(
     messageType: NetworkMessage['messageType'],
     payload: TPayload,

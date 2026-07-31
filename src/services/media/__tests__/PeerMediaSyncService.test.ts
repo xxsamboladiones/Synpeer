@@ -2,6 +2,7 @@ import type { MediaChunkData } from '@/models/MediaChunk';
 import { MediaChunk } from '@/models/MediaChunk';
 import type { MediaObjectData } from '@/models/MediaObject';
 import type { PostData } from '@/models/Post';
+import { estimateNetworkMessageBytes } from '@/network/NetworkMessage';
 import { InMemoryPeerTransport } from '@/network/PeerTransport';
 import type { PeerId } from '@/network/NetworkTypes';
 import type { MediaChunkRepository } from '@/repositories/MediaChunkRepository';
@@ -10,8 +11,12 @@ import { createStorageService } from '@/services/storage/StorageService';
 import { sha256Hex } from '@/utils/hash';
 import { openDatabaseService } from '@/database/sqliteAdapter.web';
 
+import type { MediaAvailabilityCrypto } from '../MediaAvailability';
+import { MediaAvailabilityService } from '../MediaAvailabilityService';
 import { MediaDownloadRepository } from '../MediaDownloadRepository';
-import { PeerMediaSyncService } from '../PeerMediaSyncService';
+import { MediaIntegrityService } from '../MediaIntegrityService';
+import { PeerMediaSyncService, type PeerMediaSyncOptions } from '../PeerMediaSyncService';
+import { MediaSourceSelector } from '../MediaSourceSelector';
 
 function createMediaObjectRepository(initial: MediaObjectData[] = []): MediaObjectRepository {
   const mediaObjects = new Map(initial.map((mediaObject) => [mediaObject.id, mediaObject]));
@@ -138,12 +143,21 @@ describe('PeerMediaSyncService', () => {
     const transportA = new InMemoryPeerTransport('peer-a' as PeerId);
     const transportB = new InMemoryPeerTransport('peer-b' as PeerId);
     await transportA.connect(transportB);
+    const frameLimit = 24 * 1024;
+    const partFrameBytes: number[] = [];
+    const unsubscribeFrameInspection = transportB.subscribe((message) => {
+      if (message.messageType === 'media.chunk.part') {
+        partFrameBytes.push(estimateNetworkMessageBytes(message));
+      }
+    });
 
     const serviceA = new PeerMediaSyncService(
       'peer-a' as PeerId,
       transportA,
       createMediaObjectRepository(),
       createMediaChunkRepository(chunks),
+      undefined,
+      { maxFrameBytes: frameLimit },
     );
     const mediaChunksB = createMediaChunkRepository();
     const serviceB = new PeerMediaSyncService(
@@ -165,7 +179,10 @@ describe('PeerMediaSyncService', () => {
     });
     await expect(mediaChunksB.getByMediaObjectId(mediaObjectId)).resolves.toHaveLength(1);
     expect(serviceB.getDownloadState(mediaObjectId)).toMatchObject({ status: 'available' });
+    expect(partFrameBytes.length).toBeGreaterThan(1);
+    expect(Math.max(...partFrameBytes)).toBeLessThanOrEqual(frameLimit);
 
+    unsubscribeFrameInspection();
     serviceA.stop();
     serviceB.stop();
   });
@@ -351,6 +368,80 @@ describe('PeerMediaSyncService', () => {
     serviceC.stop();
   });
 
+  it('quarantines a corrupt replica and completes the chunk from a healthy peer', async () => {
+    const mediaObjectId = 'media_corrupt_replica_hash';
+    const chunks = [
+      MediaChunk.create(mediaObjectId, 0, new Uint8Array([7, 8, 9]), 'peer-c').getData(),
+    ];
+    const post = createPostWithAttachment(mediaObjectId, chunks);
+    const transportA = new InMemoryPeerTransport('peer-a' as PeerId);
+    const transportB = new InMemoryPeerTransport('peer-b' as PeerId);
+    const transportC = new InMemoryPeerTransport('peer-c' as PeerId);
+    await transportA.connect(transportB);
+    await transportB.connect(transportC);
+    const maliciousUnsubscribe = transportA.subscribe(async (message, connection) => {
+      if (message.messageType !== 'media.chunk.request') {
+        return;
+      }
+      await connection.send(
+        'media.chunk.response',
+        {
+          version: 1,
+          type: 'media.chunk.response',
+          chunk: {
+            ...chunks[0],
+            chunkData: undefined,
+            chunkDataBase64: testBytesToBase64(new Uint8Array([9, 9, 9])),
+          },
+        },
+        { correlationId: message.correlationId },
+      );
+    });
+    const serviceC = new PeerMediaSyncService(
+      'peer-c' as PeerId,
+      transportC,
+      createMediaObjectRepository(),
+      createMediaChunkRepository(chunks),
+    );
+    const repositoryB = await createDownloadRepository();
+    const mediaChunksB = createMediaChunkRepository();
+    const serviceB = new PeerMediaSyncService(
+      'peer-b' as PeerId,
+      transportB,
+      createMediaObjectRepository(),
+      mediaChunksB,
+      undefined,
+      { requestTimeoutMs: 100, maxAttemptsPerChunk: 1 },
+      repositoryB,
+    );
+    serviceB.start();
+    serviceC.start();
+
+    const result = await serviceB.ensurePostMediaAvailable(post, 'peer-a' as PeerId);
+
+    expect(result).toEqual({ requested: 1, received: 1, skipped: 0, failed: 0 });
+    expect(repositoryB.isReplicaQuarantined('peer-a' as PeerId, mediaObjectId, chunks[0].id)).toBe(
+      true,
+    );
+    expect(
+      repositoryB.getReplicaObservation('peer-a' as PeerId, mediaObjectId, chunks[0].id),
+    ).toMatchObject({
+      status: 'corrupt',
+      failureCount: 1,
+    });
+    expect(
+      repositoryB.getReplicaObservation('peer-c' as PeerId, mediaObjectId, chunks[0].id),
+    ).toMatchObject({
+      status: 'success',
+      successCount: 1,
+    });
+    await expect(mediaChunksB.getByMediaObjectId(mediaObjectId)).resolves.toHaveLength(1);
+
+    maliciousUnsubscribe();
+    serviceB.stop();
+    serviceC.stop();
+  });
+
   it('backs off a peer after failed chunk requests and prefers healthy peers', async () => {
     const mediaObjectId = 'media_backoff_hash';
     const chunks = [
@@ -508,22 +599,18 @@ describe('PeerMediaSyncService', () => {
 
     const repositoryA = await createDownloadRepository();
     const repositoryB = await createDownloadRepository();
-    const serviceA = new PeerMediaSyncService(
+    const serviceA = createSignedMediaSyncService(
       'peer-a' as PeerId,
       transportA,
       createMediaObjectRepository([mediaObject]),
       createMediaChunkRepository(chunks),
-      undefined,
-      {},
       repositoryA,
     );
-    const serviceB = new PeerMediaSyncService(
+    const serviceB = createSignedMediaSyncService(
       'peer-b' as PeerId,
       transportB,
       createMediaObjectRepository(),
       createMediaChunkRepository(),
-      undefined,
-      {},
       repositoryB,
     );
 
@@ -545,20 +632,20 @@ describe('PeerMediaSyncService', () => {
     const mediaObject = createMediaObject(mediaObjectId, chunks, 'peer-a' as PeerId);
     const transportA = new InMemoryPeerTransport('peer-a' as PeerId);
     const transportB = new InMemoryPeerTransport('peer-b' as PeerId);
+    const repositoryA = await createDownloadRepository();
     const repositoryB = await createDownloadRepository();
-    const serviceA = new PeerMediaSyncService(
+    const serviceA = createSignedMediaSyncService(
       'peer-a' as PeerId,
       transportA,
       createMediaObjectRepository([mediaObject]),
       createMediaChunkRepository(chunks),
+      repositoryA,
     );
-    const serviceB = new PeerMediaSyncService(
+    const serviceB = createSignedMediaSyncService(
       'peer-b' as PeerId,
       transportB,
       createMediaObjectRepository(),
       createMediaChunkRepository(),
-      undefined,
-      {},
       repositoryB,
     );
     serviceA.start();
@@ -583,6 +670,7 @@ describe('PeerMediaSyncService', () => {
     const transportA = new InMemoryPeerTransport('peer-a' as PeerId);
     const transportB = new InMemoryPeerTransport('peer-b' as PeerId);
     await transportA.connect(transportB);
+    const repositoryA = await createDownloadRepository();
     const repositoryB = await createDownloadRepository();
     await repositoryB.saveState({
       mediaObjectId,
@@ -595,21 +683,21 @@ describe('PeerMediaSyncService', () => {
       updatedAt: 1,
       error: 'No connected peers can serve this media',
     });
-    const serviceA = new PeerMediaSyncService(
+    const serviceA = createSignedMediaSyncService(
       'peer-a' as PeerId,
       transportA,
       createMediaObjectRepository([mediaObject]),
       createMediaChunkRepository(chunks),
+      repositoryA,
     );
     const mediaChunksB = createMediaChunkRepository();
-    const serviceB = new PeerMediaSyncService(
+    const serviceB = createSignedMediaSyncService(
       'peer-b' as PeerId,
       transportB,
       createMediaObjectRepository([mediaObject]),
       mediaChunksB,
-      undefined,
-      { requestTimeoutMs: 1, maxAttemptsPerChunk: 1 },
       repositoryB,
+      { requestTimeoutMs: 1, maxAttemptsPerChunk: 1 },
     );
     serviceB.start();
     serviceA.start();
@@ -624,7 +712,7 @@ describe('PeerMediaSyncService', () => {
     serviceB.stop();
   });
 
-  it('uses a persisted availability manifest when the original source peer is offline', async () => {
+  it('uses a persisted signed announcement when the original source peer is offline', async () => {
     const mediaObjectId = 'media_manifest_download_hash';
     const chunks = [
       MediaChunk.create(mediaObjectId, 0, new Uint8Array([5, 4, 3]), 'peer-c').getData(),
@@ -635,8 +723,14 @@ describe('PeerMediaSyncService', () => {
     await transportB.connect(transportC);
 
     const repositoryB = await createDownloadRepository();
-    await repositoryB.saveManifest({
+    await repositoryB.saveAnnouncement({
+      version: 2,
       peerId: 'peer-c' as PeerId,
+      sequence: 1,
+      issuedAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+      pageIndex: 0,
+      pageCount: 1,
       items: [
         {
           mediaObjectId,
@@ -645,7 +739,7 @@ describe('PeerMediaSyncService', () => {
           updatedAt: 1,
         },
       ],
-      updatedAt: 1,
+      signature: 'persisted-signature',
     });
     const serviceC = new PeerMediaSyncService(
       'peer-c' as PeerId,
@@ -840,6 +934,78 @@ describe('PeerMediaSyncService', () => {
 
     service.stop();
   });
+
+  it('accepts a replica offer only when local quota can hold the missing bytes', async () => {
+    const mediaObjectId = 'media_replica_offer';
+    const chunks = [
+      MediaChunk.create(mediaObjectId, 0, new Uint8Array([8, 9, 10]), 'peer-a').getData(),
+    ];
+    const mediaObject = createMediaObject(mediaObjectId, chunks, 'peer-a' as PeerId);
+    const transportA = new InMemoryPeerTransport('peer-a' as PeerId);
+    const transportB = new InMemoryPeerTransport('peer-b' as PeerId);
+    await transportA.connect(transportB);
+    const chunksB = createMediaChunkRepository();
+    const serviceA = new PeerMediaSyncService(
+      'peer-a' as PeerId,
+      transportA,
+      createMediaObjectRepository([mediaObject]),
+      createMediaChunkRepository(chunks),
+    );
+    const serviceB = new PeerMediaSyncService(
+      'peer-b' as PeerId,
+      transportB,
+      createMediaObjectRepository([mediaObject]),
+      chunksB,
+      undefined,
+      { maxLocalMediaBytes: 10 },
+    );
+    serviceA.start();
+    serviceB.start();
+
+    await expect(serviceA.offerReplica('peer-b' as PeerId, mediaObjectId)).resolves.toBe(true);
+    await flushPromises();
+
+    expect(serviceB.getDownloadState(mediaObjectId)).toMatchObject({ status: 'available' });
+    await expect(chunksB.getByMediaObjectId(mediaObjectId)).resolves.toHaveLength(1);
+    serviceA.stop();
+    serviceB.stop();
+  });
+
+  it('rejects a replica offer without creating a download when quota is full', async () => {
+    const mediaObjectId = 'media_replica_offer_quota';
+    const chunks = [
+      MediaChunk.create(mediaObjectId, 0, new Uint8Array([8, 9, 10]), 'peer-a').getData(),
+    ];
+    const mediaObject = createMediaObject(mediaObjectId, chunks, 'peer-a' as PeerId);
+    const transportA = new InMemoryPeerTransport('peer-a' as PeerId);
+    const transportB = new InMemoryPeerTransport('peer-b' as PeerId);
+    await transportA.connect(transportB);
+    const chunksB = createMediaChunkRepository();
+    const serviceA = new PeerMediaSyncService(
+      'peer-a' as PeerId,
+      transportA,
+      createMediaObjectRepository([mediaObject]),
+      createMediaChunkRepository(chunks),
+    );
+    const serviceB = new PeerMediaSyncService(
+      'peer-b' as PeerId,
+      transportB,
+      createMediaObjectRepository([mediaObject]),
+      chunksB,
+      undefined,
+      { maxLocalMediaBytes: 1 },
+    );
+    serviceA.start();
+    serviceB.start();
+
+    await expect(serviceA.offerReplica('peer-b' as PeerId, mediaObjectId)).resolves.toBe(true);
+    await flushPromises();
+
+    expect(serviceB.getDownloadState(mediaObjectId)).toBeNull();
+    await expect(chunksB.getByMediaObjectId(mediaObjectId)).resolves.toEqual([]);
+    serviceA.stop();
+    serviceB.stop();
+  });
 });
 
 function createPostWithAttachment(mediaObjectId: string, chunks: MediaChunkData[]): PostData {
@@ -907,6 +1073,44 @@ async function createDownloadRepository(): Promise<MediaDownloadRepository> {
   return repository;
 }
 
+function createSignedMediaSyncService(
+  peerId: PeerId,
+  transport: InMemoryPeerTransport,
+  mediaObjectRepository: MediaObjectRepository,
+  mediaChunkRepository: MediaChunkRepository,
+  downloadRepository: MediaDownloadRepository,
+  options: PeerMediaSyncOptions = {},
+): PeerMediaSyncService {
+  return new PeerMediaSyncService(
+    peerId,
+    transport,
+    mediaObjectRepository,
+    mediaChunkRepository,
+    undefined,
+    options,
+    downloadRepository,
+    new MediaIntegrityService(),
+    new MediaAvailabilityService(
+      peerId,
+      new TestMediaAvailabilityCrypto(peerId),
+      downloadRepository,
+    ),
+    new MediaSourceSelector(downloadRepository),
+  );
+}
+
+class TestMediaAvailabilityCrypto implements MediaAvailabilityCrypto {
+  constructor(private readonly identity: string) {}
+
+  async sign(data: string): Promise<string> {
+    return sha256Hex(`${this.identity}:${data}`);
+  }
+
+  async verify(data: string, signature: string, publicIdentity: string): Promise<boolean> {
+    return signature === sha256Hex(`${publicIdentity}:${data}`);
+  }
+}
+
 function createMemoryStorage() {
   const values = new Map<string, string>();
   return createStorageService({
@@ -925,4 +1129,8 @@ function createMemoryStorage() {
 
 async function flushPromises(): Promise<void> {
   await new Promise((resolve) => globalThis.setTimeout(resolve, 5));
+}
+
+function testBytesToBase64(bytes: Uint8Array): string {
+  return globalThis.btoa(String.fromCharCode(...bytes));
 }

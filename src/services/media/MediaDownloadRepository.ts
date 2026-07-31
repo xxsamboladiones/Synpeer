@@ -2,7 +2,22 @@ import type { DatabaseService } from '@/database/DatabaseService';
 import { AppError, toAppError } from '@/errors/AppError';
 import type { PeerId } from '@/network/NetworkTypes';
 import type { StorageService } from '@/services/storage/StorageService';
+import { sha256Hex } from '@/utils/hash';
 
+import {
+  cloneMediaAvailabilityAnnouncement,
+  isMediaAvailabilityAnnouncementV2,
+  isMediaAvailabilityItem,
+  isMediaQuarantineReason,
+  isMediaReplicaObservationStatus,
+  type LegacyMediaAvailabilityManifest,
+  type MediaAvailabilityAnnouncementV2,
+  type MediaAvailabilityItem,
+  type MediaQuarantineReason,
+  type MediaQuarantineRecord,
+  type MediaReplicaObservation,
+  type MediaReplicaObservationStatus,
+} from './MediaAvailability';
 import type { MediaDownloadState, MediaDownloadStatus } from './PeerMediaSyncService';
 
 export const LEGACY_MEDIA_DOWNLOAD_STATES_KEY = 'media_download_states';
@@ -10,20 +25,18 @@ export const LEGACY_MEDIA_AVAILABILITY_KEY = 'media_availability_manifests';
 
 const DOWNLOAD_TABLE = 'media_download_jobs';
 const AVAILABILITY_TABLE = 'media_availability_announcements';
-const MEDIA_PERSISTENCE_SCHEMA_VERSION = 1;
+const REPLICA_OBSERVATION_TABLE = 'media_replica_observations';
+const QUARANTINE_TABLE = 'media_quarantine_records';
+const ACCESS_TABLE = 'media_access_records';
+const DOWNLOAD_SCHEMA_VERSION = 1;
+const LEGACY_AVAILABILITY_SCHEMA_VERSION = 1;
+const SIGNED_AVAILABILITY_SCHEMA_VERSION = 2;
+const REPLICA_OBSERVATION_SCHEMA_VERSION = 1;
+const QUARANTINE_SCHEMA_VERSION = 1;
+const ACCESS_SCHEMA_VERSION = 1;
 
-export interface MediaAvailabilityItem {
-  mediaObjectId: string;
-  chunks: string[];
-  totalChunks: number;
-  updatedAt: number;
-}
-
-export interface MediaAvailabilityManifest {
-  peerId: PeerId;
-  items: MediaAvailabilityItem[];
-  updatedAt: number;
-}
+export type MediaAvailabilityManifest = LegacyMediaAvailabilityManifest;
+export type { MediaAvailabilityItem } from './MediaAvailability';
 
 export interface MediaPersistenceMigrationResult {
   migratedDownloadJobs: number;
@@ -52,10 +65,60 @@ interface MediaAvailabilityRow {
   updatedAt: number;
 }
 
+interface MediaReplicaObservationRow {
+  id: string;
+  schemaVersion: number;
+  peerId: string;
+  mediaObjectId: string;
+  chunkId: string | null;
+  status: string;
+  successCount: number;
+  failureCount: number;
+  latencyMs: number | null;
+  validUntil: number | null;
+  updatedAt: number;
+}
+
+interface MediaQuarantineRow {
+  id: string;
+  schemaVersion: number;
+  peerId: string;
+  mediaObjectId: string;
+  chunkId: string | null;
+  reason: string;
+  evidenceHash: string | null;
+  failureCount: number;
+  startedAt: number;
+  expiresAt: number;
+}
+
+interface MediaAccessRow {
+  id: string;
+  schemaVersion: number;
+  mediaObjectId: string;
+  protected: number;
+  lastAccessedAt: number;
+  updatedAt: number;
+}
+
+export interface MediaAccessRecord {
+  mediaObjectId: string;
+  protected: boolean;
+  lastAccessedAt: number;
+  updatedAt: number;
+}
+
+export type SaveMediaAnnouncementResult = 'saved' | 'duplicate' | 'stale' | 'conflict';
+
 export class MediaDownloadRepository {
   private readonly states = new Map<string, MediaDownloadState>();
   private readonly manifests = new Map<PeerId, MediaAvailabilityManifest>();
+  private readonly announcements = new Map<string, MediaAvailabilityAnnouncementV2>();
+  private readonly observations = new Map<string, MediaReplicaObservation>();
+  private readonly quarantines = new Map<string, MediaQuarantineRecord>();
+  private readonly accessRecords = new Map<string, MediaAccessRecord>();
   private initialization: Promise<MediaPersistenceMigrationResult> | null = null;
+  private availabilityWriteQueue: Promise<void> = Promise.resolve();
   private initialized = false;
 
   constructor(
@@ -116,6 +179,319 @@ export class MediaDownloadRepository {
     this.manifests.set(normalized.peerId, cloneManifest(normalized));
   }
 
+  listAnnouncements(peerId?: PeerId): MediaAvailabilityAnnouncementV2[] {
+    this.assertInitialized();
+    return [...this.announcements.values()]
+      .filter((announcement) => !peerId || announcement.peerId === peerId)
+      .map(cloneMediaAvailabilityAnnouncement)
+      .sort(
+        (left, right) =>
+          right.sequence - left.sequence ||
+          left.pageIndex - right.pageIndex ||
+          String(left.peerId).localeCompare(String(right.peerId)),
+      );
+  }
+
+  getLatestAnnouncementSequence(peerId: PeerId): number {
+    this.assertInitialized();
+    return this.listAnnouncements(peerId).reduce(
+      (latest, announcement) => Math.max(latest, announcement.sequence),
+      0,
+    );
+  }
+
+  async saveAnnouncement(
+    announcement: MediaAvailabilityAnnouncementV2,
+  ): Promise<SaveMediaAnnouncementResult> {
+    this.assertInitialized();
+    const normalized = cloneMediaAvailabilityAnnouncement(announcement);
+    let result: SaveMediaAnnouncementResult = 'saved';
+    const operation = this.availabilityWriteQueue.then(async () => {
+      const peerAnnouncements = [...this.announcements.values()].filter(
+        (item) => item.peerId === normalized.peerId,
+      );
+      const latestSequence = peerAnnouncements.reduce(
+        (latest, item) => Math.max(latest, item.sequence),
+        0,
+      );
+      if (normalized.sequence < latestSequence) {
+        result = 'stale';
+        return;
+      }
+
+      const announcementId = createAnnouncementId(normalized);
+      const existing = this.announcements.get(announcementId);
+      if (existing) {
+        result =
+          existing.signature === normalized.signature &&
+          existing.expiresAt === normalized.expiresAt &&
+          existing.pageCount === normalized.pageCount
+            ? 'duplicate'
+            : 'conflict';
+        return;
+      }
+
+      const sameSequence = peerAnnouncements.filter(
+        (item) => item.sequence === normalized.sequence,
+      );
+      if (
+        sameSequence.some(
+          (item) =>
+            item.issuedAt !== normalized.issuedAt ||
+            item.expiresAt !== normalized.expiresAt ||
+            item.pageCount !== normalized.pageCount,
+        )
+      ) {
+        result = 'conflict';
+        return;
+      }
+
+      await this.database.transaction(async (transaction) => {
+        if (normalized.sequence > latestSequence) {
+          await transaction.run(`DELETE FROM ${AVAILABILITY_TABLE} WHERE peerId = ?;`, [
+            normalized.peerId,
+          ]);
+        }
+        await this.writeAnnouncement(normalized, transaction);
+      });
+
+      if (normalized.sequence > latestSequence) {
+        for (const [id, item] of this.announcements.entries()) {
+          if (item.peerId === normalized.peerId) {
+            this.announcements.delete(id);
+          }
+        }
+      }
+      this.announcements.set(announcementId, cloneMediaAvailabilityAnnouncement(normalized));
+    });
+    this.availabilityWriteQueue = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    await operation;
+    return result;
+  }
+
+  async removeAnnouncement(announcement: MediaAvailabilityAnnouncementV2): Promise<void> {
+    this.assertInitialized();
+    const id = createAnnouncementId(announcement);
+    await this.database.run(`DELETE FROM ${AVAILABILITY_TABLE} WHERE id = ?;`, [id]);
+    this.announcements.delete(id);
+  }
+
+  async pruneExpiredAnnouncements(now = Date.now()): Promise<number> {
+    this.assertInitialized();
+    const sequenceAnchors = new Set<string>();
+    const announcementsByPeer = new Map<PeerId, MediaAvailabilityAnnouncementV2[]>();
+    for (const announcement of this.announcements.values()) {
+      const peerAnnouncements = announcementsByPeer.get(announcement.peerId) ?? [];
+      peerAnnouncements.push(announcement);
+      announcementsByPeer.set(announcement.peerId, peerAnnouncements);
+    }
+    for (const peerAnnouncements of announcementsByPeer.values()) {
+      const latestSequence = peerAnnouncements.reduce(
+        (latest, announcement) => Math.max(latest, announcement.sequence),
+        0,
+      );
+      const anchor = peerAnnouncements
+        .filter((announcement) => announcement.sequence === latestSequence)
+        .sort((left, right) => left.pageIndex - right.pageIndex)[0];
+      if (anchor) {
+        sequenceAnchors.add(createAnnouncementId(anchor));
+      }
+    }
+    const expired = [...this.announcements.entries()].filter(
+      ([id, announcement]) => announcement.expiresAt <= now && !sequenceAnchors.has(id),
+    );
+    if (expired.length === 0) {
+      return 0;
+    }
+    await this.database.transaction(async (transaction) => {
+      for (const [id] of expired) {
+        await transaction.run(`DELETE FROM ${AVAILABILITY_TABLE} WHERE id = ?;`, [id]);
+      }
+    });
+    for (const [id] of expired) {
+      this.announcements.delete(id);
+    }
+    return expired.length;
+  }
+
+  getReplicaObservation(
+    peerId: PeerId,
+    mediaObjectId: string,
+    chunkId?: string,
+  ): MediaReplicaObservation | null {
+    this.assertInitialized();
+    const observation = this.observations.get(
+      createReplicaObservationId(peerId, mediaObjectId, chunkId),
+    );
+    return observation ? cloneObservation(observation) : null;
+  }
+
+  listReplicaObservations(): MediaReplicaObservation[] {
+    this.assertInitialized();
+    return [...this.observations.values()]
+      .map(cloneObservation)
+      .sort((left, right) => right.updatedAt - left.updatedAt || left.id.localeCompare(right.id));
+  }
+
+  async recordReplicaResult(input: {
+    peerId: PeerId;
+    mediaObjectId: string;
+    chunkId?: string;
+    status: MediaReplicaObservationStatus;
+    latencyMs?: number;
+    validUntil?: number;
+    now?: number;
+  }): Promise<MediaReplicaObservation> {
+    this.assertInitialized();
+    const now = input.now ?? Date.now();
+    const id = createReplicaObservationId(input.peerId, input.mediaObjectId, input.chunkId);
+    const current = this.observations.get(id);
+    const success = input.status === 'success';
+    const observation: MediaReplicaObservation = {
+      id,
+      peerId: input.peerId,
+      mediaObjectId: input.mediaObjectId,
+      chunkId: input.chunkId,
+      status: input.status,
+      successCount: (current?.successCount ?? 0) + (success ? 1 : 0),
+      failureCount: (current?.failureCount ?? 0) + (success ? 0 : 1),
+      latencyMs: input.latencyMs ?? current?.latencyMs,
+      validUntil: input.validUntil ?? current?.validUntil,
+      updatedAt: now,
+    };
+    await this.writeReplicaObservation(observation, this.database);
+    this.observations.set(id, cloneObservation(observation));
+    return cloneObservation(observation);
+  }
+
+  listQuarantines(now?: number): MediaQuarantineRecord[] {
+    this.assertInitialized();
+    return [...this.quarantines.values()]
+      .filter((record) => now === undefined || record.expiresAt > now)
+      .map(cloneQuarantine)
+      .sort((left, right) => right.startedAt - left.startedAt || left.id.localeCompare(right.id));
+  }
+
+  isReplicaQuarantined(
+    peerId: PeerId,
+    mediaObjectId: string,
+    chunkId: string,
+    now = Date.now(),
+  ): boolean {
+    this.assertInitialized();
+    return [...this.quarantines.values()].some(
+      (record) =>
+        record.peerId === peerId &&
+        record.mediaObjectId === mediaObjectId &&
+        (record.chunkId === undefined || record.chunkId === chunkId) &&
+        record.expiresAt > now,
+    );
+  }
+
+  async quarantineReplica(input: {
+    peerId: PeerId;
+    mediaObjectId: string;
+    chunkId?: string;
+    reason: MediaQuarantineReason;
+    evidenceHash?: string;
+    durationMs: number;
+    now?: number;
+  }): Promise<MediaQuarantineRecord> {
+    this.assertInitialized();
+    const now = input.now ?? Date.now();
+    const id = createQuarantineId(input.peerId, input.mediaObjectId, input.chunkId);
+    const current = this.quarantines.get(id);
+    const record: MediaQuarantineRecord = {
+      id,
+      peerId: input.peerId,
+      mediaObjectId: input.mediaObjectId,
+      chunkId: input.chunkId,
+      reason: input.reason,
+      evidenceHash: input.evidenceHash,
+      failureCount: (current?.failureCount ?? 0) + 1,
+      startedAt: current?.startedAt ?? now,
+      expiresAt: Math.max(current?.expiresAt ?? 0, now + Math.max(1, input.durationMs)),
+    };
+    await this.writeQuarantine(record, this.database);
+    this.quarantines.set(id, cloneQuarantine(record));
+    return cloneQuarantine(record);
+  }
+
+  async pruneExpiredQuarantines(now = Date.now()): Promise<number> {
+    this.assertInitialized();
+    const expired = [...this.quarantines.entries()].filter(([, record]) => record.expiresAt <= now);
+    if (expired.length === 0) {
+      return 0;
+    }
+    await this.database.transaction(async (transaction) => {
+      for (const [id] of expired) {
+        await transaction.run(`DELETE FROM ${QUARANTINE_TABLE} WHERE id = ?;`, [id]);
+      }
+    });
+    for (const [id] of expired) {
+      this.quarantines.delete(id);
+    }
+    return expired.length;
+  }
+
+  getMediaAccess(mediaObjectId: string): MediaAccessRecord | null {
+    this.assertInitialized();
+    const record = this.accessRecords.get(mediaObjectId);
+    return record ? cloneAccessRecord(record) : null;
+  }
+
+  listMediaAccess(): MediaAccessRecord[] {
+    this.assertInitialized();
+    return [...this.accessRecords.values()]
+      .map(cloneAccessRecord)
+      .sort(
+        (left, right) =>
+          right.lastAccessedAt - left.lastAccessedAt ||
+          left.mediaObjectId.localeCompare(right.mediaObjectId),
+      );
+  }
+
+  async touchMediaAccess(mediaObjectId: string, now = Date.now()): Promise<MediaAccessRecord> {
+    this.assertInitialized();
+    const current = this.accessRecords.get(mediaObjectId);
+    const record: MediaAccessRecord = {
+      mediaObjectId,
+      protected: current?.protected ?? false,
+      lastAccessedAt: Math.max(current?.lastAccessedAt ?? 0, now),
+      updatedAt: Math.max(current?.updatedAt ?? 0, now),
+    };
+    await this.writeAccessRecord(record, this.database);
+    this.accessRecords.set(mediaObjectId, cloneAccessRecord(record));
+    return cloneAccessRecord(record);
+  }
+
+  async setMediaProtected(
+    mediaObjectId: string,
+    protectedValue: boolean,
+    now = Date.now(),
+  ): Promise<MediaAccessRecord> {
+    this.assertInitialized();
+    const current = this.accessRecords.get(mediaObjectId);
+    const record: MediaAccessRecord = {
+      mediaObjectId,
+      protected: protectedValue,
+      lastAccessedAt: current?.lastAccessedAt ?? now,
+      updatedAt: Math.max(current?.updatedAt ?? 0, now),
+    };
+    await this.writeAccessRecord(record, this.database);
+    this.accessRecords.set(mediaObjectId, cloneAccessRecord(record));
+    return cloneAccessRecord(record);
+  }
+
+  async removeMediaAccess(mediaObjectId: string): Promise<void> {
+    this.assertInitialized();
+    await this.database.run(`DELETE FROM ${ACCESS_TABLE} WHERE id = ?;`, [mediaObjectId]);
+    this.accessRecords.delete(mediaObjectId);
+  }
+
   async recordChunkAvailability(
     peerId: PeerId,
     mediaObjectId: string,
@@ -142,20 +518,113 @@ export class MediaDownloadRepository {
     });
   }
 
-  findPeersForMedia(mediaObjectId: string): PeerId[] {
-    return this.listManifests()
-      .filter((manifest) => manifest.items.some((item) => item.mediaObjectId === mediaObjectId))
-      .map((manifest) => manifest.peerId);
+  findPeersForMedia(mediaObjectId: string, now = Date.now()): PeerId[] {
+    this.assertInitialized();
+    return Array.from(
+      new Set(
+        [...this.announcements.values()]
+          .filter(
+            (announcement) =>
+              announcement.expiresAt > now &&
+              announcement.items.some((item) => item.mediaObjectId === mediaObjectId),
+          )
+          .map((announcement) => announcement.peerId),
+      ),
+    ).sort((left, right) => String(left).localeCompare(String(right)));
   }
 
-  findPeersForChunk(mediaObjectId: string, chunkId: string): PeerId[] {
-    return this.listManifests()
-      .filter((manifest) =>
-        manifest.items.some(
-          (item) => item.mediaObjectId === mediaObjectId && item.chunks.includes(chunkId),
-        ),
-      )
-      .map((manifest) => manifest.peerId);
+  findCompleteReplicaPeers(
+    mediaObjectId: string,
+    expectedChunkIds: readonly string[],
+    now = Date.now(),
+  ): PeerId[] {
+    this.assertInitialized();
+    if (expectedChunkIds.length === 0) {
+      return [];
+    }
+    const expectedChunks = new Set(expectedChunkIds);
+    const announcementsByPeer = new Map<PeerId, MediaAvailabilityAnnouncementV2[]>();
+    for (const announcement of this.announcements.values()) {
+      if (announcement.expiresAt <= now) {
+        continue;
+      }
+      const existing = announcementsByPeer.get(announcement.peerId) ?? [];
+      existing.push(announcement);
+      announcementsByPeer.set(announcement.peerId, existing);
+    }
+
+    const completePeers: PeerId[] = [];
+    for (const [peerId, peerAnnouncements] of announcementsByPeer.entries()) {
+      const latestSequence = peerAnnouncements.reduce(
+        (latest, announcement) => Math.max(latest, announcement.sequence),
+        0,
+      );
+      const pages = peerAnnouncements
+        .filter((announcement) => announcement.sequence === latestSequence)
+        .sort((left, right) => left.pageIndex - right.pageIndex);
+      const firstPage = pages[0];
+      if (
+        !firstPage ||
+        pages.length !== firstPage.pageCount ||
+        pages.some(
+          (page, index) =>
+            page.pageIndex !== index ||
+            page.pageCount !== firstPage.pageCount ||
+            page.issuedAt !== firstPage.issuedAt ||
+            page.expiresAt !== firstPage.expiresAt,
+        )
+      ) {
+        continue;
+      }
+
+      const advertisedChunks = new Set<string>();
+      let totalChunks: number | null = null;
+      let inconsistent = false;
+      for (const page of pages) {
+        for (const item of page.items) {
+          if (item.mediaObjectId !== mediaObjectId) {
+            continue;
+          }
+          if (totalChunks !== null && totalChunks !== item.totalChunks) {
+            inconsistent = true;
+            break;
+          }
+          totalChunks = item.totalChunks;
+          item.chunks.forEach((chunkId) => advertisedChunks.add(chunkId));
+        }
+        if (inconsistent) {
+          break;
+        }
+      }
+
+      if (
+        !inconsistent &&
+        totalChunks === expectedChunks.size &&
+        advertisedChunks.size === expectedChunks.size &&
+        [...expectedChunks].every((chunkId) => advertisedChunks.has(chunkId))
+      ) {
+        completePeers.push(peerId);
+      }
+    }
+
+    return completePeers.sort((left, right) => String(left).localeCompare(String(right)));
+  }
+
+  findPeersForChunk(mediaObjectId: string, chunkId: string, now = Date.now()): PeerId[] {
+    this.assertInitialized();
+    return Array.from(
+      new Set(
+        [...this.announcements.values()]
+          .filter(
+            (announcement) =>
+              announcement.expiresAt > now &&
+              announcement.items.some(
+                (item) => item.mediaObjectId === mediaObjectId && item.chunks.includes(chunkId),
+              ),
+          )
+          .map((announcement) => announcement.peerId),
+      ),
+    ).sort((left, right) => String(left).localeCompare(String(right)));
   }
 
   async clear(): Promise<void> {
@@ -163,9 +632,16 @@ export class MediaDownloadRepository {
     await this.database.transaction(async (transaction) => {
       await transaction.run(`DELETE FROM ${DOWNLOAD_TABLE};`);
       await transaction.run(`DELETE FROM ${AVAILABILITY_TABLE};`);
+      await transaction.run(`DELETE FROM ${REPLICA_OBSERVATION_TABLE};`);
+      await transaction.run(`DELETE FROM ${QUARANTINE_TABLE};`);
+      await transaction.run(`DELETE FROM ${ACCESS_TABLE};`);
     });
     this.states.clear();
     this.manifests.clear();
+    this.announcements.clear();
+    this.observations.clear();
+    this.quarantines.clear();
+    this.accessRecords.clear();
   }
 
   private async initializeRepository(): Promise<MediaPersistenceMigrationResult> {
@@ -303,10 +779,17 @@ export class MediaDownloadRepository {
       }),
     );
     const currentManifests = new Map(
-      manifestRows.map((row) => {
-        const manifest = mapAvailabilityRow(row);
-        return [manifest.peerId, manifest];
-      }),
+      manifestRows
+        .map(mapAvailabilityRow)
+        .filter(
+          (
+            record,
+          ): record is {
+            kind: 'legacy';
+            manifest: MediaAvailabilityManifest;
+          } => record.kind === 'legacy',
+        )
+        .map(({ manifest }) => [manifest.peerId, manifest]),
     );
     let migratedDownloadJobs = 0;
     let migratedAvailabilityAnnouncements = 0;
@@ -347,14 +830,37 @@ export class MediaDownloadRepository {
 
   private async loadPersistedData(): Promise<void> {
     const states = (await this.readStateRows()).map(mapDownloadStateRow);
-    const manifests = (await this.readManifestRows()).map(mapAvailabilityRow);
+    const availabilityRecords = (await this.readManifestRows()).map(mapAvailabilityRow);
+    const observations = (await this.readReplicaObservationRows()).map(mapReplicaObservationRow);
+    const quarantines = (await this.readQuarantineRows()).map(mapQuarantineRow);
+    const accessRecords = (await this.readAccessRows()).map(mapAccessRow);
     this.states.clear();
     this.manifests.clear();
+    this.announcements.clear();
+    this.observations.clear();
+    this.quarantines.clear();
+    this.accessRecords.clear();
     for (const state of states) {
       this.states.set(state.mediaObjectId, cloneDownloadState(state));
     }
-    for (const manifest of manifests) {
-      this.manifests.set(manifest.peerId, cloneManifest(manifest));
+    for (const record of availabilityRecords) {
+      if (record.kind === 'legacy') {
+        this.manifests.set(record.manifest.peerId, cloneManifest(record.manifest));
+      } else {
+        this.announcements.set(
+          createAnnouncementId(record.announcement),
+          cloneMediaAvailabilityAnnouncement(record.announcement),
+        );
+      }
+    }
+    for (const observation of observations) {
+      this.observations.set(observation.id, cloneObservation(observation));
+    }
+    for (const quarantine of quarantines) {
+      this.quarantines.set(quarantine.id, cloneQuarantine(quarantine));
+    }
+    for (const accessRecord of accessRecords) {
+      this.accessRecords.set(accessRecord.mediaObjectId, cloneAccessRecord(accessRecord));
     }
   }
 
@@ -368,6 +874,21 @@ export class MediaDownloadRepository {
     return rows.map(assertAvailabilityRow);
   }
 
+  private async readReplicaObservationRows(): Promise<MediaReplicaObservationRow[]> {
+    const rows = await this.database.query(`SELECT * FROM ${REPLICA_OBSERVATION_TABLE};`);
+    return rows.map(assertReplicaObservationRow);
+  }
+
+  private async readQuarantineRows(): Promise<MediaQuarantineRow[]> {
+    const rows = await this.database.query(`SELECT * FROM ${QUARANTINE_TABLE};`);
+    return rows.map(assertQuarantineRow);
+  }
+
+  private async readAccessRows(): Promise<MediaAccessRow[]> {
+    const rows = await this.database.query(`SELECT * FROM ${ACCESS_TABLE};`);
+    return rows.map(assertAccessRow);
+  }
+
   private async writeState(state: MediaDownloadState, database: DatabaseService): Promise<void> {
     await database.run(
       `
@@ -377,7 +898,7 @@ export class MediaDownloadRepository {
       `,
       [
         state.mediaObjectId,
-        MEDIA_PERSISTENCE_SCHEMA_VERSION,
+        DOWNLOAD_SCHEMA_VERSION,
         state.status,
         state.totalChunks,
         state.downloadedChunks,
@@ -402,10 +923,102 @@ export class MediaDownloadRepository {
       `,
       [
         manifest.peerId,
-        MEDIA_PERSISTENCE_SCHEMA_VERSION,
+        LEGACY_AVAILABILITY_SCHEMA_VERSION,
         manifest.peerId,
         JSON.stringify(manifest.items),
         manifest.updatedAt,
+      ],
+    );
+  }
+
+  private async writeAnnouncement(
+    announcement: MediaAvailabilityAnnouncementV2,
+    database: DatabaseService,
+  ): Promise<void> {
+    await database.run(
+      `
+      INSERT OR REPLACE INTO ${AVAILABILITY_TABLE}
+      (id, schemaVersion, peerId, items, updatedAt)
+      VALUES (?, ?, ?, ?, ?);
+      `,
+      [
+        createAnnouncementId(announcement),
+        SIGNED_AVAILABILITY_SCHEMA_VERSION,
+        announcement.peerId,
+        JSON.stringify(announcement),
+        announcement.issuedAt,
+      ],
+    );
+  }
+
+  private async writeReplicaObservation(
+    observation: MediaReplicaObservation,
+    database: DatabaseService,
+  ): Promise<void> {
+    await database.run(
+      `
+      INSERT OR REPLACE INTO ${REPLICA_OBSERVATION_TABLE}
+      (id, schemaVersion, peerId, mediaObjectId, chunkId, status, successCount, failureCount, latencyMs, validUntil, updatedAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+      `,
+      [
+        observation.id,
+        REPLICA_OBSERVATION_SCHEMA_VERSION,
+        observation.peerId,
+        observation.mediaObjectId,
+        observation.chunkId ?? null,
+        observation.status,
+        observation.successCount,
+        observation.failureCount,
+        observation.latencyMs ?? null,
+        observation.validUntil ?? null,
+        observation.updatedAt,
+      ],
+    );
+  }
+
+  private async writeQuarantine(
+    record: MediaQuarantineRecord,
+    database: DatabaseService,
+  ): Promise<void> {
+    await database.run(
+      `
+      INSERT OR REPLACE INTO ${QUARANTINE_TABLE}
+      (id, schemaVersion, peerId, mediaObjectId, chunkId, reason, evidenceHash, failureCount, startedAt, expiresAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+      `,
+      [
+        record.id,
+        QUARANTINE_SCHEMA_VERSION,
+        record.peerId,
+        record.mediaObjectId,
+        record.chunkId ?? null,
+        record.reason,
+        record.evidenceHash ?? null,
+        record.failureCount,
+        record.startedAt,
+        record.expiresAt,
+      ],
+    );
+  }
+
+  private async writeAccessRecord(
+    record: MediaAccessRecord,
+    database: DatabaseService,
+  ): Promise<void> {
+    await database.run(
+      `
+      INSERT OR REPLACE INTO ${ACCESS_TABLE}
+      (id, schemaVersion, mediaObjectId, protected, lastAccessedAt, updatedAt)
+      VALUES (?, ?, ?, ?, ?, ?);
+      `,
+      [
+        record.mediaObjectId,
+        ACCESS_SCHEMA_VERSION,
+        record.mediaObjectId,
+        record.protected ? 1 : 0,
+        record.lastAccessedAt,
+        record.updatedAt,
       ],
     );
   }
@@ -513,22 +1126,78 @@ function mapDownloadStateRow(row: MediaDownloadJobRow): MediaDownloadState {
   return normalizeDownloadState(state);
 }
 
-function mapAvailabilityRow(row: MediaAvailabilityRow): MediaAvailabilityManifest {
-  let items: unknown;
+type StoredAvailabilityRecord =
+  | { kind: 'legacy'; manifest: MediaAvailabilityManifest }
+  | { kind: 'signed'; announcement: MediaAvailabilityAnnouncementV2 };
+
+function mapAvailabilityRow(row: MediaAvailabilityRow): StoredAvailabilityRecord {
+  let payload: unknown;
   try {
-    items = JSON.parse(row.items);
+    payload = JSON.parse(row.items);
   } catch {
     throw corruptRowError(AVAILABILITY_TABLE, row.id);
   }
-  const manifest: unknown = {
-    peerId: row.peerId,
-    items,
-    updatedAt: row.updatedAt,
-  };
-  if (!isMediaAvailabilityManifest(manifest) || manifest.peerId !== row.id) {
+
+  if (row.schemaVersion === LEGACY_AVAILABILITY_SCHEMA_VERSION) {
+    const manifest: unknown = {
+      peerId: row.peerId,
+      items: payload,
+      updatedAt: row.updatedAt,
+    };
+    if (!isMediaAvailabilityManifest(manifest) || manifest.peerId !== row.id) {
+      throw corruptRowError(AVAILABILITY_TABLE, row.id);
+    }
+    return { kind: 'legacy', manifest: normalizeManifest(manifest) };
+  }
+
+  if (
+    row.schemaVersion !== SIGNED_AVAILABILITY_SCHEMA_VERSION ||
+    !isMediaAvailabilityAnnouncementV2(payload) ||
+    payload.peerId !== row.peerId ||
+    createAnnouncementId(payload) !== row.id ||
+    payload.issuedAt !== row.updatedAt
+  ) {
     throw corruptRowError(AVAILABILITY_TABLE, row.id);
   }
-  return normalizeManifest(manifest);
+  return { kind: 'signed', announcement: cloneMediaAvailabilityAnnouncement(payload) };
+}
+
+function mapReplicaObservationRow(row: MediaReplicaObservationRow): MediaReplicaObservation {
+  return {
+    id: row.id,
+    peerId: row.peerId as PeerId,
+    mediaObjectId: row.mediaObjectId,
+    chunkId: row.chunkId ?? undefined,
+    status: row.status as MediaReplicaObservationStatus,
+    successCount: row.successCount,
+    failureCount: row.failureCount,
+    latencyMs: row.latencyMs ?? undefined,
+    validUntil: row.validUntil ?? undefined,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function mapQuarantineRow(row: MediaQuarantineRow): MediaQuarantineRecord {
+  return {
+    id: row.id,
+    peerId: row.peerId as PeerId,
+    mediaObjectId: row.mediaObjectId,
+    chunkId: row.chunkId ?? undefined,
+    reason: row.reason as MediaQuarantineReason,
+    evidenceHash: row.evidenceHash ?? undefined,
+    failureCount: row.failureCount,
+    startedAt: row.startedAt,
+    expiresAt: row.expiresAt,
+  };
+}
+
+function mapAccessRow(row: MediaAccessRow): MediaAccessRecord {
+  return {
+    mediaObjectId: row.mediaObjectId,
+    protected: row.protected === 1,
+    lastAccessedAt: row.lastAccessedAt,
+    updatedAt: row.updatedAt,
+  };
 }
 
 function assertDownloadJobRow(value: unknown): MediaDownloadJobRow {
@@ -537,7 +1206,7 @@ function assertDownloadJobRow(value: unknown): MediaDownloadJobRow {
   }
   if (
     typeof value.id !== 'string' ||
-    value.schemaVersion !== MEDIA_PERSISTENCE_SCHEMA_VERSION ||
+    value.schemaVersion !== DOWNLOAD_SCHEMA_VERSION ||
     typeof value.status !== 'string' ||
     !isNonNegativeInteger(value.totalChunks) ||
     !isNonNegativeInteger(value.downloadedChunks) ||
@@ -569,7 +1238,8 @@ function assertAvailabilityRow(value: unknown): MediaAvailabilityRow {
   }
   if (
     typeof value.id !== 'string' ||
-    value.schemaVersion !== MEDIA_PERSISTENCE_SCHEMA_VERSION ||
+    (value.schemaVersion !== LEGACY_AVAILABILITY_SCHEMA_VERSION &&
+      value.schemaVersion !== SIGNED_AVAILABILITY_SCHEMA_VERSION) ||
     typeof value.peerId !== 'string' ||
     typeof value.items !== 'string' ||
     !isTimestamp(value.updatedAt)
@@ -581,6 +1251,106 @@ function assertAvailabilityRow(value: unknown): MediaAvailabilityRow {
     schemaVersion: value.schemaVersion,
     peerId: value.peerId,
     items: value.items,
+    updatedAt: value.updatedAt,
+  };
+}
+
+function assertReplicaObservationRow(value: unknown): MediaReplicaObservationRow {
+  if (
+    !isRecord(value) ||
+    typeof value.id !== 'string' ||
+    value.schemaVersion !== REPLICA_OBSERVATION_SCHEMA_VERSION ||
+    typeof value.peerId !== 'string' ||
+    typeof value.mediaObjectId !== 'string' ||
+    !isOptionalString(value.chunkId) ||
+    !isMediaReplicaObservationStatus(value.status) ||
+    !isNonNegativeInteger(value.successCount) ||
+    !isNonNegativeInteger(value.failureCount) ||
+    (value.latencyMs !== null &&
+      value.latencyMs !== undefined &&
+      !isNonNegativeInteger(value.latencyMs)) ||
+    (value.validUntil !== null &&
+      value.validUntil !== undefined &&
+      !isTimestamp(value.validUntil)) ||
+    !isTimestamp(value.updatedAt)
+  ) {
+    throw corruptRowError(
+      REPLICA_OBSERVATION_TABLE,
+      isRecord(value) && typeof value.id === 'string' ? value.id : 'unknown',
+    );
+  }
+  return {
+    id: value.id,
+    schemaVersion: value.schemaVersion,
+    peerId: value.peerId,
+    mediaObjectId: value.mediaObjectId,
+    chunkId: value.chunkId ?? null,
+    status: value.status,
+    successCount: value.successCount,
+    failureCount: value.failureCount,
+    latencyMs: value.latencyMs ?? null,
+    validUntil: value.validUntil ?? null,
+    updatedAt: value.updatedAt,
+  };
+}
+
+function assertQuarantineRow(value: unknown): MediaQuarantineRow {
+  if (
+    !isRecord(value) ||
+    typeof value.id !== 'string' ||
+    value.schemaVersion !== QUARANTINE_SCHEMA_VERSION ||
+    typeof value.peerId !== 'string' ||
+    typeof value.mediaObjectId !== 'string' ||
+    !isOptionalString(value.chunkId) ||
+    !isMediaQuarantineReason(value.reason) ||
+    !isOptionalString(value.evidenceHash) ||
+    !isNonNegativeInteger(value.failureCount) ||
+    value.failureCount === 0 ||
+    !isTimestamp(value.startedAt) ||
+    !isTimestamp(value.expiresAt) ||
+    value.expiresAt <= value.startedAt
+  ) {
+    throw corruptRowError(
+      QUARANTINE_TABLE,
+      isRecord(value) && typeof value.id === 'string' ? value.id : 'unknown',
+    );
+  }
+  return {
+    id: value.id,
+    schemaVersion: value.schemaVersion,
+    peerId: value.peerId,
+    mediaObjectId: value.mediaObjectId,
+    chunkId: value.chunkId ?? null,
+    reason: value.reason,
+    evidenceHash: value.evidenceHash ?? null,
+    failureCount: value.failureCount,
+    startedAt: value.startedAt,
+    expiresAt: value.expiresAt,
+  };
+}
+
+function assertAccessRow(value: unknown): MediaAccessRow {
+  if (
+    !isRecord(value) ||
+    typeof value.id !== 'string' ||
+    value.schemaVersion !== ACCESS_SCHEMA_VERSION ||
+    typeof value.mediaObjectId !== 'string' ||
+    value.id !== value.mediaObjectId ||
+    (value.protected !== 0 && value.protected !== 1) ||
+    !isTimestamp(value.lastAccessedAt) ||
+    !isTimestamp(value.updatedAt)
+  ) {
+    throw corruptRowError(
+      ACCESS_TABLE,
+      isRecord(value) && typeof value.id === 'string' ? value.id : 'unknown',
+    );
+  }
+  return {
+    id: value.id,
+    schemaVersion: value.schemaVersion,
+    mediaObjectId: value.mediaObjectId,
+    protected: value.protected,
+    lastAccessedAt: value.lastAccessedAt,
     updatedAt: value.updatedAt,
   };
 }
@@ -666,15 +1436,34 @@ function isMediaAvailabilityManifest(value: unknown): value is MediaAvailability
   );
 }
 
-function isMediaAvailabilityItem(value: unknown): value is MediaAvailabilityItem {
-  return (
-    isRecord(value) &&
-    typeof value.mediaObjectId === 'string' &&
-    Array.isArray(value.chunks) &&
-    value.chunks.every((chunkId) => typeof chunkId === 'string') &&
-    isNonNegativeInteger(value.totalChunks) &&
-    isTimestamp(value.updatedAt)
-  );
+function createAnnouncementId(announcement: MediaAvailabilityAnnouncementV2): string {
+  return `media_availability_${sha256Hex(
+    JSON.stringify([announcement.peerId, announcement.sequence, announcement.pageIndex]),
+  )}`;
+}
+
+function createReplicaObservationId(
+  peerId: PeerId,
+  mediaObjectId: string,
+  chunkId?: string,
+): string {
+  return `media_replica_${sha256Hex(JSON.stringify([peerId, mediaObjectId, chunkId ?? null]))}`;
+}
+
+function createQuarantineId(peerId: PeerId, mediaObjectId: string, chunkId?: string): string {
+  return `media_quarantine_${sha256Hex(JSON.stringify([peerId, mediaObjectId, chunkId ?? null]))}`;
+}
+
+function cloneObservation(observation: MediaReplicaObservation): MediaReplicaObservation {
+  return { ...observation };
+}
+
+function cloneQuarantine(record: MediaQuarantineRecord): MediaQuarantineRecord {
+  return { ...record };
+}
+
+function cloneAccessRecord(record: MediaAccessRecord): MediaAccessRecord {
+  return { ...record };
 }
 
 function corruptLegacyError(key: string): AppError {

@@ -816,11 +816,54 @@ async function runStatement(
     );
     return;
   }
+  if (normalized.startsWith('DELETE FROM media_availability_announcements WHERE peerId')) {
+    await backend.deleteWhere(
+      'media_availability_announcements',
+      (row) => row.peerId === params[0],
+    );
+    return;
+  }
   if (normalized.startsWith('DELETE FROM media_availability_announcements')) {
     if (params.length === 0) {
       await backend.deleteWhere('media_availability_announcements', () => true);
     } else {
       await backend.deleteById('media_availability_announcements', String(params[0]));
+    }
+    return;
+  }
+  if (normalized.startsWith('INSERT OR REPLACE INTO media_replica_observations')) {
+    await backend.upsert('media_replica_observations', mapMediaReplicaObservation(params));
+    return;
+  }
+  if (normalized.startsWith('DELETE FROM media_replica_observations')) {
+    if (params.length === 0) {
+      await backend.deleteWhere('media_replica_observations', () => true);
+    } else {
+      await backend.deleteById('media_replica_observations', String(params[0]));
+    }
+    return;
+  }
+  if (normalized.startsWith('INSERT OR REPLACE INTO media_quarantine_records')) {
+    await backend.upsert('media_quarantine_records', mapMediaQuarantineRecord(params));
+    return;
+  }
+  if (normalized.startsWith('DELETE FROM media_quarantine_records')) {
+    if (params.length === 0) {
+      await backend.deleteWhere('media_quarantine_records', () => true);
+    } else {
+      await backend.deleteById('media_quarantine_records', String(params[0]));
+    }
+    return;
+  }
+  if (normalized.startsWith('INSERT OR REPLACE INTO media_access_records')) {
+    await backend.upsert('media_access_records', mapMediaAccessRecord(params));
+    return;
+  }
+  if (normalized.startsWith('DELETE FROM media_access_records')) {
+    if (params.length === 0) {
+      await backend.deleteWhere('media_access_records', () => true);
+    } else {
+      await backend.deleteById('media_access_records', String(params[0]));
     }
     return;
   }
@@ -900,6 +943,27 @@ async function queryStatement(
   if (normalized.includes('FROM media_availability_announcements')) {
     return queryMediaPersistenceRows(
       await backend.getRows('media_availability_announcements'),
+      normalized,
+      params,
+    );
+  }
+  if (normalized.includes('FROM media_replica_observations')) {
+    return queryMediaPersistenceRows(
+      await backend.getRows('media_replica_observations'),
+      normalized,
+      params,
+    );
+  }
+  if (normalized.includes('FROM media_quarantine_records')) {
+    return queryMediaPersistenceRows(
+      await backend.getRows('media_quarantine_records'),
+      normalized,
+      params,
+    );
+  }
+  if (normalized.includes('FROM media_access_records')) {
+    return queryMediaPersistenceRows(
+      await backend.getRows('media_access_records'),
       normalized,
       params,
     );
@@ -1433,6 +1497,48 @@ function mapMediaAvailabilityAnnouncement(params: readonly SQLParameter[]): Row 
     peerId: params[2],
     items: params[3],
     updatedAt: params[4],
+  };
+}
+
+function mapMediaReplicaObservation(params: readonly SQLParameter[]): Row {
+  return {
+    id: params[0],
+    schemaVersion: params[1],
+    peerId: params[2],
+    mediaObjectId: params[3],
+    chunkId: params[4],
+    status: params[5],
+    successCount: params[6],
+    failureCount: params[7],
+    latencyMs: params[8],
+    validUntil: params[9],
+    updatedAt: params[10],
+  };
+}
+
+function mapMediaQuarantineRecord(params: readonly SQLParameter[]): Row {
+  return {
+    id: params[0],
+    schemaVersion: params[1],
+    peerId: params[2],
+    mediaObjectId: params[3],
+    chunkId: params[4],
+    reason: params[5],
+    evidenceHash: params[6],
+    failureCount: params[7],
+    startedAt: params[8],
+    expiresAt: params[9],
+  };
+}
+
+function mapMediaAccessRecord(params: readonly SQLParameter[]): Row {
+  return {
+    id: params[0],
+    schemaVersion: params[1],
+    mediaObjectId: params[2],
+    protected: params[3],
+    lastAccessedAt: params[4],
+    updatedAt: params[5],
   };
 }
 

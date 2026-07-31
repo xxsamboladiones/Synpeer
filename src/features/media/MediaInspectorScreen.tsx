@@ -8,6 +8,10 @@ import { Button } from '@/components/ui/Button';
 import { appService } from '@/services/AppService';
 import type { MediaCacheCleanupResult } from '@/services/media/MediaCacheCleanupService';
 import type { StorageHealthSnapshot } from '@/runtime/StorageHealth';
+import type { RuntimeHealthSnapshot } from '@/runtime/RuntimeHealth';
+import { createLogger } from '@/observability/Logger';
+
+const logger = createLogger('MediaInspectorScreen');
 
 /**
  * MediaInspectorScreen displays media layer statistics for developers
@@ -30,10 +34,12 @@ export function MediaInspectorScreen() {
   const [busy, setBusy] = useState(false);
   const [cleanupLimitBytes, setCleanupLimitBytes] = useState<number | undefined>(undefined);
   const [storageHealth, setStorageHealth] = useState<StorageHealthSnapshot | null>(null);
+  const [mediaHealth, setMediaHealth] = useState<RuntimeHealthSnapshot['media'] | null>(null);
 
   const refreshStatistics = useCallback(async () => {
     await appService.initialize();
     const snapshot = await appService.getStorageHealth();
+    setMediaHealth(appService.getRuntimeHealth().media);
     setStorageHealth(snapshot);
     setTotalMediaObjects(snapshot.mediaObjects);
     setTotalChunks(snapshot.chunks);
@@ -88,16 +94,41 @@ export function MediaInspectorScreen() {
   }, [cleanupCache, cleanupLimitBytes]);
 
   useEffect(() => {
-    const initialRefresh = globalThis.setTimeout(() => {
-      void refreshStatistics();
-    }, 0);
-    const interval = globalThis.setInterval(() => {
-      void refreshStatistics();
-    }, 5000);
+    let disposed = false;
+    let unsubscribe: (() => void) | null = null;
+    let refreshTimeout: ReturnType<typeof globalThis.setTimeout> | null = null;
+    const scheduleRefresh = () => {
+      if (disposed || refreshTimeout) {
+        return;
+      }
+      refreshTimeout = globalThis.setTimeout(() => {
+        refreshTimeout = null;
+        if (!disposed) {
+          void refreshStatistics();
+        }
+      }, 50);
+    };
+    void appService
+      .initialize()
+      .then(() => {
+        if (disposed) {
+          return;
+        }
+        unsubscribe = appService.subscribeMediaRuntime(scheduleRefresh);
+        scheduleRefresh();
+      })
+      .catch((error: unknown) => {
+        logger.warn('media_runtime_subscription_failed', {
+          error: error instanceof Error ? error.message : 'Unable to initialize media runtime',
+        });
+      });
 
     return () => {
-      globalThis.clearTimeout(initialRefresh);
-      globalThis.clearInterval(interval);
+      disposed = true;
+      unsubscribe?.();
+      if (refreshTimeout) {
+        globalThis.clearTimeout(refreshTimeout);
+      }
     };
   }, [refreshStatistics]);
 
@@ -154,6 +185,42 @@ export function MediaInspectorScreen() {
                   {totalDocuments}
                 </Text>
               </div>
+            </div>
+          </div>
+        </Card>
+
+        <Card>
+          <div className="space-y-3">
+            <Text variant="bodySmall" tone="secondary">
+              P2P Media Runtime
+            </Text>
+            <div className="grid grid-cols-2 gap-4">
+              <MediaMetric
+                label="Fresh replica peers"
+                value={mediaHealth?.freshReplicaPeers ?? 0}
+              />
+              <MediaMetric label="Pending repairs" value={mediaHealth?.pendingRepairs ?? 0} />
+              <MediaMetric
+                label="Under-replicated"
+                value={mediaHealth?.underReplicatedObjects ?? 0}
+              />
+              <MediaMetric
+                label="Quarantined replicas"
+                value={mediaHealth?.quarantinedReplicas ?? 0}
+              />
+              <MediaMetric
+                label="Pending transfer"
+                value={formatBytes(mediaHealth?.pendingBytes ?? 0)}
+              />
+              <MediaMetric label="Blocked peers" value={mediaHealth?.blockedPeers ?? 0} />
+              <MediaMetric
+                label="Last repair"
+                value={
+                  mediaHealth?.lastRepairAt
+                    ? new Date(mediaHealth.lastRepairAt).toLocaleString()
+                    : 'Not run yet'
+                }
+              />
             </div>
           </div>
         </Card>
@@ -322,6 +389,19 @@ const cleanupPresets: Array<{ label: string; bytes?: number }> = [
   { label: '500 MB', bytes: 500 * 1024 * 1024 },
   { label: '1 GB', bytes: 1024 * 1024 * 1024 },
 ];
+
+function MediaMetric({ label, value }: { label: string; value: string | number }) {
+  return (
+    <div>
+      <Text variant="caption" tone="muted">
+        {label}
+      </Text>
+      <Text variant="body" tone="primary">
+        {value}
+      </Text>
+    </div>
+  );
+}
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) {

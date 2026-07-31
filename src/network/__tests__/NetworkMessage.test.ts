@@ -1,5 +1,7 @@
 import {
   createNetworkMessage,
+  estimateNetworkMessageBytes,
+  MAX_NETWORK_MESSAGE_BYTES,
   NetworkMessageDeduplicator,
   validateNetworkMessage,
 } from '../NetworkMessage';
@@ -75,6 +77,23 @@ describe('NetworkMessage', () => {
     expect(validateNetworkMessage(message, 200)).toEqual({
       valid: true,
       message,
+    });
+  });
+
+  it('measures the serialized protocol limit in UTF-8 bytes', () => {
+    const message = createNetworkMessage({
+      messageType: 'social.post',
+      senderId: 'peer-a',
+      timestamp: 100,
+      ttlMs: 1000,
+      payload: { text: 'á'.repeat(MAX_NETWORK_MESSAGE_BYTES / 2) },
+    });
+
+    expect(JSON.stringify(message).length).toBeLessThan(MAX_NETWORK_MESSAGE_BYTES);
+    expect(estimateNetworkMessageBytes(message)).toBeGreaterThan(MAX_NETWORK_MESSAGE_BYTES);
+    expect(validateNetworkMessage(message, 200)).toEqual({
+      valid: false,
+      error: 'Message exceeds size limit',
     });
   });
 });

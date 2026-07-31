@@ -36,6 +36,18 @@ export interface RuntimeHealthSnapshot {
     messagesReceived: number;
     pendingMessages: number;
   };
+  media: {
+    downloadJobs: number;
+    activeDownloads: number;
+    freshReplicaPeers: number;
+    quarantinedReplicas: number;
+    queuedFrames: number;
+    pendingBytes: number;
+    blockedPeers: number;
+    pendingRepairs: number;
+    underReplicatedObjects: number;
+    lastRepairAt: number | null;
+  };
 }
 
 export interface RuntimeHealthInput {
@@ -51,6 +63,7 @@ export interface RuntimeHealthInput {
   storage: RuntimeHealthSnapshot['storage'];
   trustedPeers: Array<{ trustStatus: 'unknown' | 'verified' | 'blocked' }>;
   transports: RuntimeHealthSnapshot['transports'];
+  media?: RuntimeHealthSnapshot['media'];
 }
 
 export function createRuntimeHealthSnapshot(input: RuntimeHealthInput): RuntimeHealthSnapshot {
@@ -82,5 +95,17 @@ export function createRuntimeHealthSnapshot(input: RuntimeHealthInput): RuntimeH
       blocked: input.trustedPeers.filter((peer) => peer.trustStatus === 'blocked').length,
     },
     transports: input.transports,
+    media: input.media ?? {
+      downloadJobs: 0,
+      activeDownloads: 0,
+      freshReplicaPeers: 0,
+      quarantinedReplicas: 0,
+      queuedFrames: 0,
+      pendingBytes: 0,
+      blockedPeers: 0,
+      pendingRepairs: 0,
+      underReplicatedObjects: 0,
+      lastRepairAt: null,
+    },
   };
 }

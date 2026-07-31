@@ -171,6 +171,18 @@ export class AppService {
     return await applicationRuntime.cleanupMediaCache(options);
   }
 
+  async markMediaAccess(mediaObjectId: string): Promise<void> {
+    await applicationRuntime.markMediaAccess(mediaObjectId);
+  }
+
+  getMediaRepairSnapshot() {
+    return applicationRuntime.getMediaRepairSnapshot();
+  }
+
+  subscribeMediaRuntime(handler: () => void): () => void {
+    return applicationRuntime.subscribeMediaRuntime(handler);
+  }
+
   async clearPeerData() {
     await this.initialize();
     return await applicationRuntime.clearPeerData();

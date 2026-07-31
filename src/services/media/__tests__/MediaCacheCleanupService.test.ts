@@ -51,6 +51,28 @@ describe('MediaCacheCleanupService', () => {
     await expect(chunks.getByMediaObjectId('missing_media')).resolves.toHaveLength(0);
   });
 
+  it('removes a corrupt chunk even when its media object is still referenced', async () => {
+    const validChunk = createChunk('media_corrupt', 0, [1, 2, 3]);
+    const corruptChunk = { ...validChunk, chunkData: new Uint8Array([9, 2, 3]) };
+    const mediaObjects = createMediaObjectRepository([
+      createMediaObject('media_corrupt', [validChunk], 1),
+    ]);
+    const chunks = createMediaChunkRepository([corruptChunk]);
+    const posts = createPostRepository([createPost('post-corrupt', 'media_corrupt')]);
+    const service = new MediaCacheCleanupService(posts, mediaObjects, chunks);
+
+    const result = await service.cleanup();
+
+    expect(result).toMatchObject({
+      protectedMediaObjects: 1,
+      deletedMediaObjects: 0,
+      deletedChunks: 1,
+      freedBytes: 3,
+      remainingBytes: 0,
+    });
+    await expect(mediaObjects.getById('media_corrupt')).resolves.toBeTruthy();
+  });
+
   it('does not delete protected media even when it exceeds the configured size limit', async () => {
     const protectedChunks = [createChunk('media_protected_large', 0, [1, 2, 3, 4])];
     const mediaObjects = createMediaObjectRepository([
@@ -70,6 +92,86 @@ describe('MediaCacheCleanupService', () => {
       remainingBytes: 4,
     });
   });
+
+  it('protects local uploads and active downloads even when they are not referenced', async () => {
+    const localChunks = [createChunk('media_local', 0, [1, 2])];
+    const activeChunks = [createChunk('media_active', 0, [3, 4])];
+    const mediaObjects = createMediaObjectRepository([
+      createMediaObject('media_local', localChunks, 1, 'peer-local' as PeerId),
+      createMediaObject('media_active', activeChunks, 2, 'peer-remote' as PeerId),
+    ]);
+    const chunks = createMediaChunkRepository([...localChunks, ...activeChunks]);
+    const service = new MediaCacheCleanupService(createPostRepository([]), mediaObjects, chunks, {
+      localPeerId: 'peer-local' as PeerId,
+      downloadRepository: createRetentionRepository({ activeMediaId: 'media_active' }),
+    });
+
+    const result = await service.cleanup();
+
+    expect(result).toMatchObject({
+      protectedMediaObjects: 2,
+      protectedByActiveDownload: 1,
+      deletedMediaObjects: 0,
+      remainingBytes: 4,
+    });
+  });
+
+  it('protects recently opened media using the persisted access timestamp', async () => {
+    const recentChunks = [createChunk('media_recent', 0, [1, 2])];
+    const mediaObjects = createMediaObjectRepository([
+      createMediaObject('media_recent', recentChunks, 1, 'peer-remote' as PeerId),
+    ]);
+    const chunks = createMediaChunkRepository(recentChunks);
+    const service = new MediaCacheCleanupService(createPostRepository([]), mediaObjects, chunks, {
+      now: () => 10_000,
+      recentAccessProtectionMs: 1_000,
+      downloadRepository: createRetentionRepository({
+        access: {
+          mediaObjectId: 'media_recent',
+          protected: false,
+          lastAccessedAt: 9_500,
+          updatedAt: 9_500,
+        },
+      }),
+    });
+
+    const result = await service.cleanup();
+
+    expect(result).toMatchObject({
+      protectedByRecentAccess: 1,
+      deletedMediaObjects: 0,
+      remainingBytes: 2,
+    });
+  });
+
+  it('evicts an externally replicated object before the last known local replica', async () => {
+    const replicatedChunks = [createChunk('media_replicated', 0, [1, 2])];
+    const uniqueChunks = [createChunk('media_unique', 0, [3, 4])];
+    const mediaObjects = createMediaObjectRepository([
+      createMediaObject('media_replicated', replicatedChunks, 1, 'peer-remote' as PeerId),
+      createMediaObject('media_unique', uniqueChunks, 2, 'peer-remote' as PeerId),
+    ]);
+    const chunks = createMediaChunkRepository([...replicatedChunks, ...uniqueChunks]);
+    const posts = createPostRepository([
+      createPost('post-replicated', 'media_replicated'),
+      createPost('post-unique', 'media_unique'),
+    ]);
+    const service = new MediaCacheCleanupService(posts, mediaObjects, chunks, {
+      maxBytes: 2,
+      downloadRepository: createRetentionRepository({ replicatedMediaId: 'media_replicated' }),
+    });
+
+    const result = await service.cleanup();
+
+    expect(result).toMatchObject({
+      protectedAsLastKnownReplica: 1,
+      deletedMediaObjects: 1,
+      freedBytes: 2,
+      remainingBytes: 2,
+    });
+    await expect(mediaObjects.getById('media_replicated')).resolves.toBeNull();
+    await expect(mediaObjects.getById('media_unique')).resolves.toBeTruthy();
+  });
 });
 
 function createChunk(mediaObjectId: string, position: number, bytes: number[]): MediaChunkData {
@@ -85,6 +187,7 @@ function createMediaObject(
   mediaObjectId: string,
   chunks: MediaChunkData[],
   updatedAt: number,
+  author: PeerId = 'peer-a' as PeerId,
 ): MediaObjectData {
   const bytes = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.size, 0));
   let offset = 0;
@@ -94,7 +197,7 @@ function createMediaObject(
   }
   return {
     id: mediaObjectId,
-    author: 'peer-a' as PeerId,
+    author,
     createdAt: updatedAt,
     updatedAt,
     signature: 'signature',
@@ -104,6 +207,41 @@ function createMediaObject(
     size: bytes.length,
     hash: sha256Hex(bytes),
     chunks: chunks.map((chunk) => chunk.id),
+  };
+}
+
+function createRetentionRepository(
+  options: {
+    activeMediaId?: string;
+    replicatedMediaId?: string;
+    access?: {
+      mediaObjectId: string;
+      protected: boolean;
+      lastAccessedAt: number;
+      updatedAt: number;
+    };
+  } = {},
+) {
+  return {
+    findCompleteReplicaPeers: (mediaObjectId: string) =>
+      mediaObjectId === options.replicatedMediaId ? (['peer-copy'] as PeerId[]) : [],
+    getMediaAccess: (mediaObjectId: string) =>
+      options.access?.mediaObjectId === mediaObjectId ? options.access : null,
+    getState: (mediaObjectId: string) =>
+      mediaObjectId === options.activeMediaId
+        ? {
+            mediaObjectId,
+            status: 'downloading' as const,
+            totalChunks: 1,
+            downloadedChunks: 0,
+            requestedChunks: 0,
+            failedChunks: 0,
+            candidatePeers: [],
+            updatedAt: 1,
+          }
+        : null,
+    pruneExpiredAnnouncements: async () => 0,
+    removeMediaAccess: async () => undefined,
   };
 }
 

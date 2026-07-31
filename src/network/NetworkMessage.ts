@@ -26,6 +26,7 @@ export type NetworkMessageType =
   | 'media.chunk.response'
   | 'media.chunk.part'
   | 'media.availability.announce'
+  | 'media.replica.offer'
   | 'unknown';
 
 export interface NetworkMessage<TPayload = unknown> {
@@ -117,7 +118,7 @@ export function validateNetworkMessage(
     return { valid: false, error: 'Message expired' };
   }
 
-  if (estimateMessageBytes(data) > MAX_NETWORK_MESSAGE_BYTES) {
+  if (estimateNetworkMessageBytes(data) > MAX_NETWORK_MESSAGE_BYTES) {
     return { valid: false, error: 'Message exceeds size limit' };
   }
 
@@ -172,12 +173,33 @@ export class NetworkMessageDeduplicator {
   }
 }
 
-function estimateMessageBytes(data: unknown): number {
+export function estimateNetworkMessageBytes(data: unknown): number {
   try {
-    return JSON.stringify(data).length;
+    return utf8ByteLength(JSON.stringify(data));
   } catch {
     return MAX_NETWORK_MESSAGE_BYTES + 1;
   }
+}
+
+export function utf8ByteLength(value: string): number {
+  if (typeof globalThis.TextEncoder === 'function') {
+    return new globalThis.TextEncoder().encode(value).length;
+  }
+
+  let bytes = 0;
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    if (codePoint <= 0x7f) {
+      bytes += 1;
+    } else if (codePoint <= 0x7ff) {
+      bytes += 2;
+    } else if (codePoint <= 0xffff) {
+      bytes += 3;
+    } else {
+      bytes += 4;
+    }
+  }
+  return bytes;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

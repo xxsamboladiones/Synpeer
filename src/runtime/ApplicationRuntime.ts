@@ -22,6 +22,9 @@ import { MediaService } from '../services/media/MediaService';
 import { PeerMediaSyncService } from '../services/media/PeerMediaSyncService';
 import { MediaDownloadRepository } from '../services/media/MediaDownloadRepository';
 import { MediaIntegrityService } from '../services/media/MediaIntegrityService';
+import { MediaAvailabilityService } from '../services/media/MediaAvailabilityService';
+import { MediaSourceSelector } from '../services/media/MediaSourceSelector';
+import { MediaRepairService } from '../services/media/MediaRepairService';
 import {
   MediaCacheCleanupService,
   type MediaCacheCleanupResult,
@@ -137,6 +140,9 @@ export class ApplicationRuntime implements RuntimeLifecycle {
   private mediaUploadService: MediaService | null = null;
   private peerMediaSyncService: PeerMediaSyncService | null = null;
   private mediaDownloadRepository: MediaDownloadRepository | null = null;
+  private mediaAvailabilityService: MediaAvailabilityService | null = null;
+  private mediaRepairService: MediaRepairService | null = null;
+  private unsubscribeMediaAvailability: (() => void) | null = null;
   private mediaCacheCleanupService: MediaCacheCleanupService | null = null;
   private readonly mediaIntegrityService = new MediaIntegrityService();
   private contributionEngine: ContributionEngine | null = null;
@@ -291,6 +297,20 @@ export class ApplicationRuntime implements RuntimeLifecycle {
           )
         : null;
     const transportStats = this.getNetworkTransportStats();
+    const mediaTransfer = this.peerMediaSyncService?.getTransferSchedulerSnapshot();
+    const mediaRepair = this.mediaRepairService?.getSnapshot();
+    const mediaDownloadStates =
+      this.isReady() && this.mediaDownloadRepository
+        ? this.mediaDownloadRepository.listStates()
+        : [];
+    const freshReplicaPeers = new Set(
+      (this.isReady() && this.mediaDownloadRepository
+        ? this.mediaDownloadRepository.listAnnouncements()
+        : []
+      )
+        .filter((announcement) => announcement.expiresAt > Date.now())
+        .map((announcement) => announcement.peerId),
+    );
 
     return createRuntimeHealthSnapshot({
       state: this.state,
@@ -316,7 +336,24 @@ export class ApplicationRuntime implements RuntimeLifecycle {
       transports: {
         messagesSent: transportStats?.messagesSent ?? 0,
         messagesReceived: transportStats?.messagesReceived ?? 0,
-        pendingMessages: 0,
+        pendingMessages: mediaTransfer?.queuedFrames ?? 0,
+      },
+      media: {
+        downloadJobs: mediaDownloadStates.length,
+        activeDownloads: mediaDownloadStates.filter(
+          (state) => state.status === 'queued' || state.status === 'downloading',
+        ).length,
+        freshReplicaPeers: freshReplicaPeers.size,
+        quarantinedReplicas:
+          this.isReady() && this.mediaDownloadRepository
+            ? this.mediaDownloadRepository.listQuarantines(Date.now()).length
+            : 0,
+        queuedFrames: mediaTransfer?.queuedFrames ?? 0,
+        pendingBytes: (mediaTransfer?.queuedBytes ?? 0) + (mediaTransfer?.inFlightBytes ?? 0),
+        blockedPeers: mediaTransfer?.blockedPeers ?? 0,
+        pendingRepairs: mediaRepair?.pendingOffers ?? 0,
+        underReplicatedObjects: mediaRepair?.underReplicatedObjects ?? 0,
+        lastRepairAt: mediaRepair?.lastRepairAt ?? null,
       },
     });
   }
@@ -829,6 +866,7 @@ export class ApplicationRuntime implements RuntimeLifecycle {
     if (
       !this.config.enableMedia ||
       !this.localPeerId ||
+      !this.cryptoService ||
       !transport ||
       !this.mediaObjectRepository ||
       !this.mediaChunkRepository
@@ -836,15 +874,58 @@ export class ApplicationRuntime implements RuntimeLifecycle {
       return undefined;
     }
     if (!this.peerMediaSyncService) {
+      const mediaDownloadRepository = this.requireMediaDownloadRepository();
+      this.mediaAvailabilityService = new MediaAvailabilityService(
+        this.localPeerId,
+        this.cryptoService,
+        mediaDownloadRepository,
+      );
       this.peerMediaSyncService = new PeerMediaSyncService(
         this.localPeerId,
         transport,
         this.mediaObjectRepository,
         this.mediaChunkRepository,
         undefined,
-        {},
-        this.requireMediaDownloadRepository(),
+        {
+          canAcceptReplicaOffer: (peerId) => {
+            const peer = this.trustedPeerRepository?.get(peerId);
+            return peer?.trustStatus === 'verified' && peer.sessionState !== 'blocked';
+          },
+          onLocalAvailabilityAnnounced: () => {
+            const repairService = this.mediaRepairService;
+            if (!repairService) {
+              return;
+            }
+            if (!repairService.getSnapshot().running) {
+              repairService.start();
+            } else {
+              repairService.scheduleRepair('local-availability');
+            }
+          },
+        },
+        mediaDownloadRepository,
         this.mediaIntegrityService,
+        this.mediaAvailabilityService,
+        new MediaSourceSelector(mediaDownloadRepository),
+      );
+      this.mediaRepairService = new MediaRepairService(
+        this.localPeerId,
+        this.mediaObjectRepository,
+        this.mediaChunkRepository,
+        mediaDownloadRepository,
+        {
+          getEligiblePeers: () => this.getSocialReplicationPeers(),
+          offerReplica: async (peerId, mediaObjectId) => {
+            const mediaSync = this.peerMediaSyncService;
+            return mediaSync ? await mediaSync.offerReplica(peerId, mediaObjectId) : false;
+          },
+        },
+        this.mediaIntegrityService,
+      );
+      this.unsubscribeMediaAvailability = this.mediaAvailabilityService.subscribeAccepted(
+        (announcement) => {
+          this.mediaRepairService?.handleAvailabilityAnnouncement(announcement);
+        },
       );
       this.peerMediaSyncService.start();
       this.logger.info('peer_media_sync_started');
@@ -1069,6 +1150,7 @@ export class ApplicationRuntime implements RuntimeLifecycle {
       void this.peerMediaSyncService?.announceLocalAvailability().catch((error) => {
         this.logger.error('media_availability_announce_failed', error, { peerId: event.peerId });
       });
+      this.mediaRepairService?.scheduleRepair('peer-connected');
     };
     this.networkService.getNetworkEvents().addEventListener('peer', peerListener);
     this.unsubscribePeerTrustEvents = () => {
@@ -1134,8 +1216,14 @@ export class ApplicationRuntime implements RuntimeLifecycle {
     this.unsubscribeSocialReplication = null;
     this.boundSocialTransport = null;
     this.socialReplicationService?.stop();
+    this.unsubscribeMediaAvailability?.();
+    this.unsubscribeMediaAvailability = null;
+    this.mediaRepairService?.stop();
+    this.mediaRepairService = null;
+    this.mediaAvailabilityService = null;
     this.peerMediaSyncService?.stop();
     this.peerMediaSyncService = null;
+    this.mediaCacheCleanupService = null;
 
     await this.networkService?.stop();
     this.peerTrustService?.stop();
@@ -1253,6 +1341,11 @@ export class ApplicationRuntime implements RuntimeLifecycle {
       this.unsubscribeSocialReplication = null;
       this.applicationEventService?.stop();
       this.socialReplicationService?.stop();
+      this.unsubscribeMediaAvailability?.();
+      this.unsubscribeMediaAvailability = null;
+      this.mediaRepairService?.stop();
+      this.mediaRepairService = null;
+      this.mediaAvailabilityService = null;
       this.peerMediaSyncService?.stop();
       this.peerMediaSyncService = null;
       this.peerTrustService?.stop();
@@ -1443,10 +1536,37 @@ export class ApplicationRuntime implements RuntimeLifecycle {
         this.postRepository,
         this.mediaObjectRepository,
         this.mediaChunkRepository,
-        options,
+        {
+          ...options,
+          localPeerId: this.localPeerId ?? undefined,
+          downloadRepository: this.mediaDownloadRepository ?? undefined,
+        },
       );
     }
     return this.mediaCacheCleanupService;
+  }
+
+  async markMediaAccess(mediaObjectId: string): Promise<void> {
+    await this.requireMediaDownloadRepository().touchMediaAccess(mediaObjectId);
+  }
+
+  getMediaRepairSnapshot() {
+    return this.mediaRepairService?.getSnapshot() ?? null;
+  }
+
+  subscribeMediaRuntime(handler: () => void): () => void {
+    const unsubscribes: Array<() => void> = [];
+    if (this.peerMediaSyncService) {
+      unsubscribes.push(this.peerMediaSyncService.subscribeDownloadStates(() => handler()));
+    }
+    if (this.mediaRepairService) {
+      unsubscribes.push(this.mediaRepairService.subscribe(() => handler()));
+    }
+    return () => {
+      for (const unsubscribe of unsubscribes) {
+        unsubscribe();
+      }
+    };
   }
 
   getConsensusEngine() {

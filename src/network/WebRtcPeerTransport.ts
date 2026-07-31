@@ -4,12 +4,18 @@ import { createLogger } from '@/observability/Logger';
 
 import {
   createNetworkMessage,
+  estimateNetworkMessageBytes,
   MAX_NETWORK_MESSAGE_BYTES,
   NetworkMessageDeduplicator,
   type NetworkMessage,
   validateNetworkMessage,
 } from './NetworkMessage';
-import type { PeerConnection, PeerTransport, PeerTransportHandler } from './PeerTransport';
+import type {
+  PeerConnection,
+  PeerConnectionFlowControl,
+  PeerTransport,
+  PeerTransportHandler,
+} from './PeerTransport';
 import type { PeerId } from './NetworkTypes';
 import {
   createWebRtcSessionId,
@@ -913,6 +919,37 @@ class WebRtcPeerConnection implements PeerConnection {
     return this.transport.localPeerId;
   }
 
+  get flowControl(): PeerConnectionFlowControl {
+    return {
+      getBufferedAmount: () =>
+        this.transport.getOpenDataChannel(this.sessionId)?.bufferedAmount ??
+        Number.POSITIVE_INFINITY,
+      getHighWaterMark: () => this.transport.getMaxBufferedAmount(),
+      setLowWaterMark: (bytes) => {
+        const channel = this.transport.getOpenDataChannel(this.sessionId);
+        if (channel) {
+          channel.bufferedAmountLowThreshold = Math.max(0, Math.floor(bytes));
+        }
+      },
+      isOpen: () => Boolean(this.transport.getOpenDataChannel(this.sessionId)),
+      subscribe: (handler) => {
+        const channel = this.transport.getOpenDataChannel(this.sessionId);
+        if (!channel) {
+          return () => undefined;
+        }
+        const notify = () => handler();
+        channel.addEventListener('bufferedamountlow', notify);
+        channel.addEventListener('close', notify);
+        channel.addEventListener('error', notify);
+        return () => {
+          channel.removeEventListener('bufferedamountlow', notify);
+          channel.removeEventListener('close', notify);
+          channel.removeEventListener('error', notify);
+        };
+      },
+    };
+  }
+
   async send<TPayload>(
     messageType: NetworkMessage['messageType'],
     payload: TPayload,
@@ -950,7 +987,8 @@ class WebRtcPeerConnection implements PeerConnection {
       });
     }
     const serialized = JSON.stringify(message);
-    if (serialized.length > MAX_NETWORK_MESSAGE_BYTES) {
+    const serializedBytes = estimateNetworkMessageBytes(message);
+    if (serializedBytes > MAX_NETWORK_MESSAGE_BYTES) {
       throw new AppError({
         code: 'NETWORK_ERROR',
         message: 'WebRTC message exceeds size limit',
@@ -970,6 +1008,6 @@ class WebRtcPeerConnection implements PeerConnection {
     }
     channel.send(serialized);
     this.lastSeenAt = Date.now();
-    this.transport.recordSent(serialized.length);
+    this.transport.recordSent(serializedBytes);
   }
 }

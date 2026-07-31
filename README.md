@@ -24,7 +24,7 @@ not intentionally persisted by either signaling adapter.
 | Synchronization | Incremental signed replication with deduplication and retry                   |
 | Multi-hop       | TTL-limited gossip and durable relay queues                                   |
 | Chat            | Destination-encrypted payloads, delivery/read receipts and offline outbox     |
-| Media           | Deterministic chunking, hash validation, resume and local cache               |
+| Media           | Signed availability, verified chunks, failover, repair and retention          |
 | Persistence     | IndexedDB/SQLite adapters plus versioned migrations                           |
 | Diagnostics     | Structured logs, runtime health and developer inspectors                      |
 
@@ -121,6 +121,30 @@ testing adapter, not a hardened public signaling service.
 
 The full two-peer and four-peer procedures are in [Demo guide](docs/demo.md).
 
+## Media Durability
+
+Media is described by a deterministic manifest and transferred as independently
+verified chunks. A peer only marks an object as available after validating every
+chunk and the final object hash.
+
+- Availability announcements are signed, versioned, sequenced, paginated and
+  expire automatically. Legacy announcements remain readable for migration but
+  are not trusted for source selection.
+- Source selection uses fresh announcements, persisted transfer observations,
+  latency, retry backoff and local quarantine. A repeatedly corrupt source is
+  skipped without discarding chunks already verified from another source.
+- The transfer scheduler accounts for the complete UTF-8 and base64 protocol
+  envelope, applies per-peer queue and byte limits and observes WebRTC
+  `bufferedAmount` before sending more frames.
+- Background repair offers under-replicated objects only to connected, verified
+  peers. An offer is considered successful only after the receiving peer
+  publishes a valid signed announcement containing the complete manifest.
+- Retention protects local uploads, active downloads, recently opened media,
+  explicitly protected objects and the last locally known replica. Corrupt and
+  orphaned chunks are removed during cleanup.
+- Runtime health and the media inspector expose real download, queue, replica,
+  quarantine, backpressure and repair state through runtime subscriptions.
+
 ## Security Model
 
 - Ed25519 signs identities and signed social/protocol records.
@@ -185,6 +209,15 @@ npm run test:e2e:mesh
 npm run test:e2e:mesh:repeat
 ```
 
+Latest validated baseline on July 31, 2026:
+
+- Secret scan, lint and TypeScript checks passed.
+- 66 Jest suites and 345 tests passed.
+- Expo web export completed successfully.
+- Nine Playwright mesh scenarios passed in three isolated repetitions of the
+  A-B-C-D topology, covering durable multi-hop chat, mesh creation and partition
+  recovery.
+
 ## Known Limitations
 
 - Browser-to-browser connectivity still depends on NAT, firewall, STUN/TURN and
@@ -194,8 +227,12 @@ npm run test:e2e:mesh:repeat
 - Abuse resistance, quotas, peer scoring and malicious-input hardening are not
   complete.
 - Protocol compatibility and data migrations need long-lived release testing.
-- Media source selection, signed availability, backpressure, repair and garbage
-  collection are still being hardened.
+- Remote-corruption and automatic-repair scenarios still need dedicated
+  Playwright coverage. The current repair and retention guarantees are based on
+  local observations and fresh signed peer announcements, not a global proof of
+  durability.
+- Browser storage can be evicted by quota or user policy, and background repair
+  cannot run while every eligible peer or the local browser is offline.
 - The native mobile transport path has not reached the same validation level as
   the web path.
 - Legacy compatibility code remains in a few modules and is being removed

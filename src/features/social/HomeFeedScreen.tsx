@@ -540,6 +540,7 @@ function PostMediaPreview({
           }
           return false;
         }
+        await recordMediaAccess(attachment.id);
 
         if (objectUrlRef.current) {
           webGlobals.revokeObjectURL(objectUrlRef.current);
@@ -638,6 +639,7 @@ function PostMediaPreview({
         });
         return;
       }
+      await recordMediaAccess(attachment.id);
       const webGlobals = getWebMediaGlobals();
       if (!webGlobals) {
         setState({ status: 'unsupported' });
@@ -909,6 +911,17 @@ async function ensureAttachmentMetadata(input: {
 }
 
 type WebBlobConstructor = new (parts: ArrayBuffer[], options: { type: string }) => unknown;
+
+async function recordMediaAccess(mediaObjectId: string): Promise<void> {
+  try {
+    await appService.markMediaAccess(mediaObjectId);
+  } catch (error) {
+    logger.warn('media_access_record_failed', {
+      mediaObjectId,
+      error: error instanceof Error ? error.message : 'Unable to persist media access',
+    });
+  }
+}
 
 function getWebMediaGlobals(): {
   Blob: WebBlobConstructor;

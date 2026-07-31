@@ -12,6 +12,7 @@ import {
   MediaDownloadRepository,
   type MediaAvailabilityManifest,
 } from '../MediaDownloadRepository';
+import type { MediaAvailabilityAnnouncementV2 } from '../MediaAvailability';
 import type { MediaDownloadState } from '../PeerMediaSyncService';
 
 describe('MediaDownloadRepository', () => {
@@ -26,7 +27,9 @@ describe('MediaDownloadRepository', () => {
     await firstRepository.initialize();
 
     await firstRepository.saveState(createState({ status: 'partial', downloadedChunks: 1 }));
-    await firstRepository.saveManifest(createManifest());
+    await firstRepository.saveAnnouncement(createAnnouncement());
+    await firstRepository.touchMediaAccess('media-a', 30);
+    await firstRepository.setMediaProtected('media-a', true, 31);
     await firstDatabase.close();
 
     const secondDatabase = await openDatabaseService({ databaseName });
@@ -38,6 +41,12 @@ describe('MediaDownloadRepository', () => {
       downloadedChunks: 1,
     });
     expect(secondRepository.findPeersForChunk('media-a', 'chunk-a')).toEqual(['peer-a']);
+    expect(secondRepository.getMediaAccess('media-a')).toEqual({
+      mediaObjectId: 'media-a',
+      protected: true,
+      lastAccessedAt: 30,
+      updatedAt: 31,
+    });
 
     await secondRepository.removeState('media-a');
     expect(secondRepository.getState('media-a')).toBeNull();
@@ -59,6 +68,109 @@ describe('MediaDownloadRepository', () => {
         chunks: ['chunk-a'],
         totalChunks: 1,
       }),
+    ]);
+    await database.close();
+  });
+
+  it('persists signed announcements, replica observations and quarantine across reopen', async () => {
+    const databaseName = 'synpeer-media-source-health-reopen';
+    const firstDatabase = await openDatabaseService({ databaseName });
+    const firstRepository = new MediaDownloadRepository(firstDatabase);
+    await firstRepository.initialize();
+
+    await expect(firstRepository.saveAnnouncement(createAnnouncement())).resolves.toBe('saved');
+    await firstRepository.recordReplicaResult({
+      peerId: 'peer-a' as PeerId,
+      mediaObjectId: 'media-a',
+      chunkId: 'chunk-a',
+      status: 'success',
+      latencyMs: 42,
+      now: 20,
+    });
+    await firstRepository.quarantineReplica({
+      peerId: 'peer-b' as PeerId,
+      mediaObjectId: 'media-a',
+      chunkId: 'chunk-a',
+      reason: 'chunk-hash-mismatch',
+      evidenceHash: 'evidence',
+      durationMs: 1000,
+      now: 20,
+    });
+    await firstDatabase.close();
+
+    const reopenedDatabase = await openDatabaseService({ databaseName });
+    const reopenedRepository = new MediaDownloadRepository(reopenedDatabase);
+    await reopenedRepository.initialize();
+
+    expect(reopenedRepository.listAnnouncements()).toEqual([createAnnouncement()]);
+    expect(
+      reopenedRepository.getReplicaObservation('peer-a' as PeerId, 'media-a', 'chunk-a'),
+    ).toMatchObject({
+      status: 'success',
+      successCount: 1,
+      failureCount: 0,
+      latencyMs: 42,
+    });
+    expect(
+      reopenedRepository.isReplicaQuarantined('peer-b' as PeerId, 'media-a', 'chunk-a', 21),
+    ).toBe(true);
+    expect(
+      reopenedRepository.isReplicaQuarantined('peer-b' as PeerId, 'media-a', 'chunk-a', 1020),
+    ).toBe(false);
+    await reopenedDatabase.close();
+  });
+
+  it('rejects stale and conflicting announcement pages without replacing current state', async () => {
+    const database = await openDatabaseService({
+      databaseName: 'synpeer-media-announcement-sequence',
+    });
+    const repository = new MediaDownloadRepository(database);
+    await repository.initialize();
+    const current = createAnnouncement({ sequence: 2, signature: 'signature-current' });
+
+    await expect(repository.saveAnnouncement(current)).resolves.toBe('saved');
+    await expect(repository.saveAnnouncement(createAnnouncement({ sequence: 1 }))).resolves.toBe(
+      'stale',
+    );
+    await expect(repository.saveAnnouncement(current)).resolves.toBe('duplicate');
+    await expect(
+      repository.saveAnnouncement({ ...current, signature: 'signature-conflict' }),
+    ).resolves.toBe('conflict');
+    expect(repository.listAnnouncements()).toEqual([current]);
+    await database.close();
+  });
+
+  it('counts a replica only when every signed announcement page covers the full manifest', async () => {
+    const database = await openDatabaseService({
+      databaseName: 'synpeer-media-complete-replica-pages',
+    });
+    const repository = new MediaDownloadRepository(database);
+    await repository.initialize();
+    const shared = {
+      sequence: 3,
+      issuedAt: 20,
+      expiresAt: 4_102_444_800_000,
+      pageCount: 2,
+    };
+
+    await repository.saveAnnouncement(
+      createAnnouncement({
+        ...shared,
+        pageIndex: 0,
+        items: [{ mediaObjectId: 'media-a', chunks: ['chunk-a'], totalChunks: 2, updatedAt: 20 }],
+      }),
+    );
+    expect(repository.findCompleteReplicaPeers('media-a', ['chunk-a', 'chunk-b'])).toEqual([]);
+
+    await repository.saveAnnouncement(
+      createAnnouncement({
+        ...shared,
+        pageIndex: 1,
+        items: [{ mediaObjectId: 'media-a', chunks: ['chunk-b'], totalChunks: 2, updatedAt: 20 }],
+      }),
+    );
+    expect(repository.findCompleteReplicaPeers('media-a', ['chunk-a', 'chunk-b'])).toEqual([
+      'peer-a',
     ]);
     await database.close();
   });
@@ -175,11 +287,30 @@ describe('MediaDownloadRepository', () => {
     await repository.initialize();
     await repository.saveState(createState());
     await repository.saveManifest(createManifest());
+    await repository.saveAnnouncement(createAnnouncement());
+    await repository.recordReplicaResult({
+      peerId: 'peer-a' as PeerId,
+      mediaObjectId: 'media-a',
+      chunkId: 'chunk-a',
+      status: 'unavailable',
+    });
+    await repository.quarantineReplica({
+      peerId: 'peer-a' as PeerId,
+      mediaObjectId: 'media-a',
+      chunkId: 'chunk-a',
+      reason: 'chunk-hash-mismatch',
+      durationMs: 1000,
+    });
+    await repository.touchMediaAccess('media-a', 20);
 
     await repository.clear();
 
     expect(repository.listStates()).toEqual([]);
     expect(repository.listManifests()).toEqual([]);
+    expect(repository.listAnnouncements()).toEqual([]);
+    expect(repository.listReplicaObservations()).toEqual([]);
+    expect(repository.listQuarantines()).toEqual([]);
+    expect(repository.listMediaAccess()).toEqual([]);
     await database.close();
   });
 });
@@ -210,6 +341,23 @@ function createManifest(): MediaAvailabilityManifest {
       },
     ],
     updatedAt: 10,
+  };
+}
+
+function createAnnouncement(
+  overrides: Partial<MediaAvailabilityAnnouncementV2> = {},
+): MediaAvailabilityAnnouncementV2 {
+  return {
+    version: 2,
+    peerId: 'peer-a' as PeerId,
+    sequence: 1,
+    issuedAt: 10,
+    expiresAt: 4_102_444_800_000,
+    pageIndex: 0,
+    pageCount: 1,
+    items: createManifest().items,
+    signature: 'signature',
+    ...overrides,
   };
 }
 

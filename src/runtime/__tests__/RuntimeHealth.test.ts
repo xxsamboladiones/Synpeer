@@ -32,12 +32,30 @@ describe('RuntimeHealth', () => {
         messagesReceived: 5,
         pendingMessages: 1,
       },
+      media: {
+        downloadJobs: 4,
+        activeDownloads: 1,
+        freshReplicaPeers: 2,
+        quarantinedReplicas: 1,
+        queuedFrames: 3,
+        pendingBytes: 4096,
+        blockedPeers: 1,
+        pendingRepairs: 2,
+        underReplicatedObjects: 1,
+        lastRepairAt: 900,
+      },
     });
 
     expect(snapshot.network.knownPeers).toBe(2);
     expect(snapshot.network.connectionQuality).toBe('good');
     expect(snapshot.peers).toEqual({ trusted: 3, verified: 1, blocked: 1 });
     expect(snapshot.sync.pending).toBe(1);
+    expect(snapshot.media).toMatchObject({
+      pendingBytes: 4096,
+      freshReplicaPeers: 2,
+      pendingRepairs: 2,
+      lastRepairAt: 900,
+    });
   });
 
   it('reports offline when there are no connected peers', () => {
@@ -59,5 +77,6 @@ describe('RuntimeHealth', () => {
     expect(snapshot.network.running).toBe(false);
     expect(snapshot.network.connectionQuality).toBe('offline');
     expect(snapshot.network.knownPeers).toBe(1);
+    expect(snapshot.media).toMatchObject({ pendingBytes: 0, lastRepairAt: null });
   });
 });
