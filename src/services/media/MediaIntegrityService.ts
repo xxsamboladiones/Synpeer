@@ -27,6 +27,8 @@ export interface MediaChunkExpectation {
   position: number;
 }
 
+export type MediaChunkManifestEntry = MediaChunkExpectation;
+
 export interface InvalidMediaChunk {
   chunkId: string;
   position: number;
@@ -62,6 +64,45 @@ export class MediaIntegrityService {
 
   static createChunkId(mediaObjectId: string, position: number, hash: string): string {
     return `chunk_${mediaObjectId}_${position}_${hash.substring(0, 16)}`;
+  }
+
+  resolveChunkManifest(
+    media: Pick<MediaIntegrityDescriptor, 'id' | 'chunks'>,
+  ): MediaChunkManifestEntry[] | null {
+    if (media.chunks.length === 0) {
+      return null;
+    }
+    const prefix = `chunk_${media.id}_`;
+    const entries: Array<MediaChunkManifestEntry | undefined> = Array(media.chunks.length).fill(
+      undefined,
+    );
+    const chunkIds = new Set<string>();
+
+    for (const chunkId of media.chunks) {
+      if (chunkIds.has(chunkId) || !chunkId.startsWith(prefix)) {
+        return null;
+      }
+      const match = /^(0|[1-9]\d*)_([a-f0-9]{16})$/.exec(chunkId.slice(prefix.length));
+      if (!match) {
+        return null;
+      }
+      const position = Number(match[1]);
+      if (
+        !Number.isSafeInteger(position) ||
+        position < 0 ||
+        position >= media.chunks.length ||
+        entries[position] !== undefined
+      ) {
+        return null;
+      }
+      chunkIds.add(chunkId);
+      entries[position] = { mediaObjectId: media.id, chunkId, position };
+    }
+
+    if (entries.some((entry) => entry === undefined)) {
+      return null;
+    }
+    return entries as MediaChunkManifestEntry[];
   }
 
   validateChunk(
@@ -121,12 +162,20 @@ export class MediaIntegrityService {
     media: MediaIntegrityDescriptor,
     storedChunks: readonly MediaChunkData[],
   ): MediaIntegrityReport {
-    const expectedPositions = new Map<string, number>();
-    media.chunks.forEach((chunkId, position) => {
-      if (!expectedPositions.has(chunkId)) {
-        expectedPositions.set(chunkId, position);
-      }
-    });
+    const manifest = this.resolveChunkManifest(media);
+    if (!manifest || manifest.length === 0) {
+      return {
+        available: false,
+        complete: false,
+        fileHashValid: false,
+        validChunks: [],
+        invalidChunks: [],
+        missingChunkIds: [...media.chunks],
+      };
+    }
+    const expectedPositions = new Map(
+      manifest.map((entry) => [entry.chunkId, entry.position] as const),
+    );
 
     const validChunks: MediaChunkData[] = [];
     const invalidChunks: InvalidMediaChunk[] = [];
@@ -169,11 +218,10 @@ export class MediaIntegrityService {
 
     validChunks.sort((left, right) => left.position - right.position);
     const validChunkIds = new Set(validChunks.map((chunk) => chunk.id));
-    const missingChunkIds = media.chunks.filter((chunkId) => !validChunkIds.has(chunkId));
-    const complete =
-      media.chunks.length > 0 &&
-      expectedPositions.size === media.chunks.length &&
-      missingChunkIds.length === 0;
+    const missingChunkIds = manifest
+      .map((entry) => entry.chunkId)
+      .filter((chunkId) => !validChunkIds.has(chunkId));
+    const complete = expectedPositions.size === manifest.length && missingChunkIds.length === 0;
 
     if (!complete) {
       return {

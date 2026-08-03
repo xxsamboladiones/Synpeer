@@ -73,6 +73,57 @@ describe('MediaCacheCleanupService', () => {
     await expect(mediaObjects.getById('media_corrupt')).resolves.toBeTruthy();
   });
 
+  it('preserves valid chunks when the persisted manifest is sorted lexically', async () => {
+    const mediaId = 'media_canonical_manifest';
+    const canonicalChunks = Array.from({ length: 11 }, (_, position) =>
+      createChunk(mediaId, position, [position]),
+    );
+    const mediaObject = createMediaObject(mediaId, canonicalChunks, 1);
+    const mediaObjects = createMediaObjectRepository([
+      { ...mediaObject, chunks: [...mediaObject.chunks].sort() },
+    ]);
+    const chunks = createMediaChunkRepository(canonicalChunks);
+    const posts = createPostRepository([createPost('post-canonical-manifest', mediaId)]);
+    const service = new MediaCacheCleanupService(posts, mediaObjects, chunks);
+
+    const result = await service.cleanup();
+
+    expect(result.deletedChunks).toBe(0);
+    await expect(chunks.getByMediaObjectId(mediaId)).resolves.toHaveLength(11);
+  });
+
+  it('preserves recoverable chunks when the media manifest is invalid', async () => {
+    const mediaId = 'media-invalid-manifest';
+    const validChunks = [createChunk(mediaId, 0, [1, 2]), createChunk(mediaId, 1, [3, 4])];
+    const mediaObject = createMediaObject(mediaId, validChunks, 1);
+    const mediaObjects = createMediaObjectRepository([
+      { ...mediaObject, chunks: [validChunks[0].id, validChunks[0].id] },
+    ]);
+    const chunks = createMediaChunkRepository(validChunks);
+    const posts = createPostRepository([createPost('post-invalid-manifest', mediaId)]);
+    const service = new MediaCacheCleanupService(posts, mediaObjects, chunks);
+
+    const result = await service.cleanup();
+
+    expect(result.deletedChunks).toBe(0);
+    await expect(chunks.getByMediaObjectId(mediaId)).resolves.toHaveLength(2);
+  });
+
+  it('preserves recoverable chunks when the media manifest is empty', async () => {
+    const mediaId = 'media-empty-manifest';
+    const validChunks = [createChunk(mediaId, 0, [1, 2])];
+    const mediaObject = createMediaObject(mediaId, validChunks, 1);
+    const mediaObjects = createMediaObjectRepository([{ ...mediaObject, chunks: [] }]);
+    const chunks = createMediaChunkRepository(validChunks);
+    const posts = createPostRepository([createPost('post-empty-manifest', mediaId)]);
+    const service = new MediaCacheCleanupService(posts, mediaObjects, chunks);
+
+    const result = await service.cleanup();
+
+    expect(result.deletedChunks).toBe(0);
+    await expect(chunks.getByMediaObjectId(mediaId)).resolves.toHaveLength(1);
+  });
+
   it('does not delete protected media even when it exceeds the configured size limit', async () => {
     const protectedChunks = [createChunk('media_protected_large', 0, [1, 2, 3, 4])];
     const mediaObjects = createMediaObjectRepository([

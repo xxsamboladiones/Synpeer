@@ -171,6 +171,15 @@ interface MediaChunkPartsSendResult {
   complete: boolean;
 }
 
+interface CachedChunkManifestPositions {
+  updatedAt: number;
+  signature: string;
+  hash: string;
+  size: number;
+  totalChunks: number;
+  positions: ReadonlyMap<string, number>;
+}
+
 export class PeerMediaSyncService {
   private static readonly REQUEST_TIMEOUT_MS = 10000;
   private static readonly MAX_ATTEMPTS_PER_CHUNK = 2;
@@ -186,6 +195,7 @@ export class PeerMediaSyncService {
   private static readonly CORRUPT_REPLICA_QUARANTINE_MS = 30 * 60 * 1000;
   private static readonly REPLICA_OFFER_TTL_MS = 2 * 60 * 1000;
   private static readonly DEFAULT_MAX_LOCAL_MEDIA_BYTES = 1024 * 1024 * 1024;
+  private static readonly MAX_CHUNK_MANIFEST_CACHE_ENTRIES = 128;
   private readonly logger: Logger;
   private unsubscribe: (() => void) | null = null;
   private readonly pending = new Map<string, PendingChunkRequest>();
@@ -195,6 +205,7 @@ export class PeerMediaSyncService {
   private readonly activeDownloads = new Set<string>();
   private readonly stateHandlers = new Set<MediaDownloadStateHandler>();
   private readonly peerStats = new Map<PeerId, MediaPeerTransferStats>();
+  private readonly chunkManifestPositions = new Map<string, CachedChunkManifestPositions>();
   private queueProcessing = false;
   private stateWriteQueue: Promise<void> = Promise.resolve();
   private requestSequence = 0;
@@ -276,6 +287,7 @@ export class PeerMediaSyncService {
     }
     this.pending.clear();
     this.pendingParts.clear();
+    this.chunkManifestPositions.clear();
     this.downloadQueue.clear();
     this.activeDownloads.clear();
     this.queueProcessing = false;
@@ -585,6 +597,18 @@ export class PeerMediaSyncService {
     candidatePeers: PeerId[],
   ): Promise<PeerMediaSyncResult> {
     const result: PeerMediaSyncResult = { requested: 0, received: 0, skipped: 0, failed: 0 };
+    const manifest = this.integrityService.resolveChunkManifest(attachment);
+    if (!manifest || manifest.length === 0) {
+      result.failed = attachment.chunks.length || 1;
+      await this.updateDownloadState(attachment.id, {
+        status: 'failed',
+        totalChunks: attachment.chunks.length,
+        failedChunks: result.failed,
+        candidatePeers,
+        error: 'Media chunk manifest is invalid',
+      });
+      return result;
+    }
     const localIntegrity = await this.inspectAndRepairMedia(attachment);
     const localChunkIds = new Set(localIntegrity.validChunks.map((chunk) => chunk.id));
     const alreadyComplete = localIntegrity.complete;
@@ -624,9 +648,7 @@ export class PeerMediaSyncService {
     }
 
     result.skipped = localChunkIds.size;
-    const missingChunks = attachment.chunks
-      .map((chunkId, position) => ({ chunkId, position }))
-      .filter(({ chunkId }) => !localChunkIds.has(chunkId));
+    const missingChunks = manifest.filter(({ chunkId }) => !localChunkIds.has(chunkId));
 
     await runWithConcurrency(
       missingChunks,
@@ -834,13 +856,12 @@ export class PeerMediaSyncService {
       (await this.mediaChunkRepository.getById(payload.chunkId)) ??
       (await this.mediaChunkRepository.getByPosition(payload.mediaObjectId, payload.position));
     const mediaObject = await this.mediaObjectRepository.getById(payload.mediaObjectId);
-    const expectedPosition = mediaObject?.chunks.indexOf(payload.chunkId);
+    const expectedPosition = mediaObject
+      ? this.getChunkManifestPositions(mediaObject)?.get(payload.chunkId)
+      : undefined;
     if (
       !chunk ||
-      (mediaObject &&
-        (expectedPosition === undefined ||
-          expectedPosition < 0 ||
-          expectedPosition !== payload.position)) ||
+      (mediaObject && (expectedPosition === undefined || expectedPosition !== payload.position)) ||
       chunk.mediaObjectId !== payload.mediaObjectId
     ) {
       this.logger.warn('chunk_request_missed', {
@@ -897,6 +918,52 @@ export class PeerMediaSyncService {
       mediaObjectId: responsePayload.chunk.mediaObjectId,
       chunkId: responsePayload.chunk.id,
     });
+  }
+
+  private getChunkManifestPositions(
+    mediaObject: MediaObjectData,
+  ): ReadonlyMap<string, number> | null {
+    const cached = this.chunkManifestPositions.get(mediaObject.id);
+    if (
+      cached &&
+      cached.updatedAt === mediaObject.updatedAt &&
+      cached.signature === mediaObject.signature &&
+      cached.hash === mediaObject.hash &&
+      cached.size === mediaObject.size &&
+      cached.totalChunks === mediaObject.chunks.length
+    ) {
+      this.chunkManifestPositions.delete(mediaObject.id);
+      this.chunkManifestPositions.set(mediaObject.id, cached);
+      return cached.positions;
+    }
+
+    const manifest = this.integrityService.resolveChunkManifest(mediaObject);
+    if (!manifest) {
+      // Invalid metadata may be repaired in place, so do not retain a negative cache entry.
+      this.chunkManifestPositions.delete(mediaObject.id);
+      return null;
+    }
+    const positions = new Map(manifest.map((entry) => [entry.chunkId, entry.position] as const));
+    this.chunkManifestPositions.delete(mediaObject.id);
+    this.chunkManifestPositions.set(mediaObject.id, {
+      updatedAt: mediaObject.updatedAt,
+      signature: mediaObject.signature,
+      hash: mediaObject.hash,
+      size: mediaObject.size,
+      totalChunks: mediaObject.chunks.length,
+      positions,
+    });
+
+    while (
+      this.chunkManifestPositions.size > PeerMediaSyncService.MAX_CHUNK_MANIFEST_CACHE_ENTRIES
+    ) {
+      const oldestMediaObjectId = this.chunkManifestPositions.keys().next().value;
+      if (oldestMediaObjectId === undefined) {
+        break;
+      }
+      this.chunkManifestPositions.delete(oldestMediaObjectId);
+    }
+    return positions;
   }
 
   private async handleChunkResponse(

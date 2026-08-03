@@ -27,6 +27,45 @@ describe('MediaIntegrityService', () => {
     expect(Array.from(report.fileData ?? [])).toEqual([1, 2, 3, 4, 5]);
   });
 
+  it('resolves positions from deterministic ids when a signed manifest is sorted lexically', () => {
+    const service = new MediaIntegrityService();
+    const chunks = createChunks(
+      'media-canonical-manifest',
+      Array.from({ length: 11 }, (_, position) => new Uint8Array([position])),
+    );
+    const media = {
+      ...createDescriptor('media-canonical-manifest', chunks),
+      chunks: chunks.map((chunk) => chunk.id).sort(),
+    };
+
+    const manifest = service.resolveChunkManifest(media);
+    const report = service.inspectMedia(media, chunks);
+
+    expect(manifest?.map((entry) => entry.position)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    expect(manifest?.map((entry) => entry.chunkId)).toEqual(chunks.map((chunk) => chunk.id));
+    expect(report.available).toBe(true);
+    expect(report.fileData).toEqual(new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]));
+  });
+
+  it('rejects a manifest whose deterministic ids do not cover unique contiguous positions', () => {
+    const service = new MediaIntegrityService();
+    const chunks = createChunks('media-invalid-manifest', [
+      new Uint8Array([1]),
+      new Uint8Array([2]),
+    ]);
+    const media = {
+      ...createDescriptor('media-invalid-manifest', chunks),
+      chunks: [chunks[0].id, chunks[0].id],
+    };
+
+    expect(service.resolveChunkManifest(media)).toBeNull();
+    expect(service.inspectMedia(media, chunks)).toMatchObject({
+      available: false,
+      complete: false,
+      validChunks: [],
+    });
+  });
+
   it('identifies only the altered chunk and keeps the other chunks resumable', () => {
     const service = new MediaIntegrityService();
     const chunks = createChunks('media-corrupt', [

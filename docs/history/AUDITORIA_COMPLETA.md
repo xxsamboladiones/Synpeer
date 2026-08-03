@@ -1,3 +1,4 @@
+# “Auditoria histórica; não representa o estado atual”.
 # Relatório de Auditoria Completa - Synpeer
 
 ## Arquivos Analisados

@@ -7,6 +7,7 @@ import { InMemoryPeerTransport } from '@/network/PeerTransport';
 import type { PeerId } from '@/network/NetworkTypes';
 import type { MediaChunkRepository } from '@/repositories/MediaChunkRepository';
 import type { MediaObjectRepository } from '@/repositories/MediaObjectRepository';
+import { createUnsignedPost } from '@/services/social/SocialCanonical';
 import { createStorageService } from '@/services/storage/StorageService';
 import { sha256Hex } from '@/utils/hash';
 import { openDatabaseService } from '@/database/sqliteAdapter.web';
@@ -15,6 +16,7 @@ import type { MediaAvailabilityCrypto } from '../MediaAvailability';
 import { MediaAvailabilityService } from '../MediaAvailabilityService';
 import { MediaDownloadRepository } from '../MediaDownloadRepository';
 import { MediaIntegrityService } from '../MediaIntegrityService';
+import { MediaService } from '../MediaService';
 import { PeerMediaSyncService, type PeerMediaSyncOptions } from '../PeerMediaSyncService';
 import { MediaSourceSelector } from '../MediaSourceSelector';
 
@@ -83,6 +85,116 @@ function createMediaChunkRepository(initial: MediaChunkData[] = []): MediaChunkR
 }
 
 describe('PeerMediaSyncService', () => {
+  it('reconstructs an 11-chunk RAR after canonical chunk IDs are sorted lexically', async () => {
+    const archiveBytes = new Uint8Array(41);
+    archiveBytes.set([0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00]);
+    for (let index = 8; index < archiveBytes.length; index += 1) {
+      archiveBytes[index] = (index * 17) % 251;
+    }
+
+    const mediaObjectsA = createMediaObjectRepository();
+    const mediaChunksA = createMediaChunkRepository();
+    const sourceMedia = new MediaService(mediaObjectsA, mediaChunksA, {
+      defaultChunkSize: 4,
+    });
+    const upload = await sourceMedia.uploadMedia(
+      'peer-a' as PeerId,
+      'document',
+      'application/vnd.rar',
+      archiveBytes,
+    );
+    expect(upload.success).toBe(true);
+    expect(upload.mediaObject).toBeDefined();
+    const mediaObject = upload.mediaObject!;
+    expect(mediaObject.chunks).toHaveLength(11);
+
+    const post = createUnsignedPost({
+      author: 'peer-a' as PeerId,
+      text: 'RAR archive',
+      createdAt: 1,
+      mediaAttachments: [
+        {
+          id: mediaObject.id,
+          type: mediaObject.type,
+          mime: mediaObject.mime,
+          size: mediaObject.size,
+          hash: mediaObject.hash,
+          chunks: mediaObject.chunks,
+          name: 'archive.rar',
+        },
+      ],
+    });
+
+    const canonicalChunkIds = [...mediaObject.chunks].sort();
+    expect(canonicalChunkIds).not.toEqual(mediaObject.chunks);
+    expect(post.mediaAttachments?.[0]?.chunks).toEqual(canonicalChunkIds);
+    const invalidChunkIds = [...canonicalChunkIds];
+    invalidChunkIds[1] = invalidChunkIds[0];
+    await mediaObjectsA.update({ ...mediaObject, chunks: invalidChunkIds });
+
+    const transportA = new InMemoryPeerTransport('peer-a' as PeerId);
+    const transportB = new InMemoryPeerTransport('peer-b' as PeerId);
+    await transportA.connect(transportB);
+    const sourceIntegrity = new MediaIntegrityService();
+    const sourceManifestResolution = jest.spyOn(sourceIntegrity, 'resolveChunkManifest');
+    const serviceA = new PeerMediaSyncService(
+      'peer-a' as PeerId,
+      transportA,
+      mediaObjectsA,
+      mediaChunksA,
+      undefined,
+      {},
+      undefined,
+      sourceIntegrity,
+    );
+    const mediaObjectsB = createMediaObjectRepository();
+    const mediaChunksB = createMediaChunkRepository();
+    const serviceB = new PeerMediaSyncService(
+      'peer-b' as PeerId,
+      transportB,
+      mediaObjectsB,
+      mediaChunksB,
+      undefined,
+      { requestTimeoutMs: 100, maxAttemptsPerChunk: 1 },
+    );
+    const destinationMedia = new MediaService(mediaObjectsB, mediaChunksB);
+    serviceA.start();
+    serviceB.start();
+
+    try {
+      const sourceConnection = transportB.getConnection('peer-a' as PeerId);
+      expect(sourceConnection).not.toBeNull();
+      await sourceConnection!.send(
+        'media.chunk.request',
+        {
+          version: 1,
+          type: 'media.chunk.request',
+          mediaObjectId: mediaObject.id,
+          chunkId: canonicalChunkIds[0],
+          position: 0,
+        },
+        { correlationId: 'prime-invalid-manifest' },
+      );
+      await mediaObjectsA.update({ ...mediaObject, chunks: canonicalChunkIds });
+
+      const result = await serviceB.ensurePostMediaAvailable(post, 'peer-a' as PeerId);
+      const downloaded = await destinationMedia.getLocalMediaBytes(mediaObject.id);
+
+      expect(result).toEqual({ requested: 11, received: 11, skipped: 0, failed: 0 });
+      expect(serviceB.getDownloadState(mediaObject.id)).toMatchObject({
+        status: 'available',
+        totalChunks: 11,
+        downloadedChunks: 11,
+      });
+      expect(downloaded.success).toBe(true);
+      expect(downloaded.fileData).toEqual(archiveBytes);
+      expect(sourceManifestResolution.mock.calls.length).toBeLessThan(mediaObject.chunks.length);
+    } finally {
+      serviceA.stop();
+      serviceB.stop();
+    }
+  });
+
   it('downloads missing post attachment chunks from the peer that delivered the post', async () => {
     const mediaObjectId = 'media_image_hash';
     const chunks = [

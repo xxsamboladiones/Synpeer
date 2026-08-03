@@ -222,15 +222,35 @@ export class MediaCacheCleanupService {
     existingMediaObjects: ReadonlyMap<string, MediaObjectData>,
   ): Promise<{ deletedChunks: number; freedBytes: number }> {
     const chunks = await this.mediaChunkRepository.getAll();
+    const positionsByMedia = new Map<string, ReadonlyMap<string, number> | null>();
+    for (const [mediaObjectId, mediaObject] of existingMediaObjects) {
+      const manifest = this.integrityService.resolveChunkManifest(mediaObject);
+      positionsByMedia.set(
+        mediaObjectId,
+        manifest?.length
+          ? new Map(manifest.map((entry) => [entry.chunkId, entry.position] as const))
+          : null,
+      );
+    }
     let deletedChunks = 0;
     let freedBytes = 0;
 
     for (const chunk of chunks) {
       const mediaObject = existingMediaObjects.get(chunk.mediaObjectId);
-      const expectedPosition = mediaObject?.chunks.indexOf(chunk.id) ?? -1;
+      if (!mediaObject) {
+        await this.mediaChunkRepository.delete(chunk.id);
+        deletedChunks += 1;
+        freedBytes += chunk.size;
+        continue;
+      }
+
+      const positions = positionsByMedia.get(chunk.mediaObjectId);
+      if (!positions) {
+        continue;
+      }
+      const expectedPosition = positions.get(chunk.id);
       const valid =
-        mediaObject &&
-        expectedPosition >= 0 &&
+        expectedPosition !== undefined &&
         this.integrityService.validateChunk(chunk, {
           mediaObjectId: mediaObject.id,
           chunkId: chunk.id,
