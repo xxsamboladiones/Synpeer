@@ -1,3 +1,9 @@
+## Support Synpeer
+
+If you believe in a more private and decentralized internet, you can support the development of Synpeer:
+
+☕ [Support Synpeer on Buy Me a Coffee](https://buymeacoffee.com/xxsamboladiones)
+
 # Synpeer
 
 Synpeer is an experimental local-first peer-to-peer social network built with
